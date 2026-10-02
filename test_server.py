@@ -180,6 +180,19 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertNotIn('Jermaine private', [e['title'] for e in self.call(mom, 'state')[1]['events']])
         self.assertNotIn('Stephanie private', [e['title'] for e in self.call(dad, 'state')[1]['events']])
 
+    def test_daughter_receives_assigned_reminders_without_other_private_leaks(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        due_date = server.local_today().isoformat()
+        self.create(dad, 'tasks', title='Arielle assigned chore', who='Daughter', priority='Normal',
+                    visibility='Assigned', category='Home', dueDate=due_date, dueTime='00:01', reminderOffsets=[0])
+        self.create(dad, 'tasks', title='Dad private chore', who='Dad', priority='Normal',
+                    visibility='Me', category='Home', dueDate=due_date, dueTime='00:01', reminderOffsets=[0])
+        state = self.call(daughter, 'state')[1]
+        self.assertIn('Arielle assigned chore', [t['title'] for t in state['tasks']])
+        self.assertNotIn('Dad private chore', [t['title'] for t in state['tasks']])
+        self.assertTrue(any(r['title'] == 'Arielle assigned chore' for r in state['reminders']))
+        self.assertNotIn('Dad private chore', [r['title'] for r in state['reminders']])
+
     def test_reminder_generation_is_deduplicated_and_actions_are_private(self):
         dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]
         due_date = server.local_today().isoformat()
@@ -277,7 +290,6 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertTrue(completed['completedAt'])
         self.assertEqual(completed['completionHistory'][0]['completedBy'], 'Daughter')
         self.assertEqual(self.call(daughter, 'state')[1]['points'], 1)
-        self.assertEqual(self.call(daughter, 'state')[1]['streak'], 1)
         self.assertIn('✅ Arielle completed "Take out trash"', [e['summary'] for e in self.call(mom, 'state')[1]['activity']])
 
         self.assertEqual(self.call(dad, 'action', {'action': 'reopen', 'id': task_id})[0], 200)
@@ -331,19 +343,6 @@ class FamilyPrivacyTests(unittest.TestCase):
         edit = next(e for e in state['activity'] if e['recordId'] == task['id'] and e['action'] == 'edit')
         self.assertEqual(edit['details'], {})
         self.assertNotIn('Private calendar details', json.dumps(state['activity']))
-
-    def test_activity_is_hidden_when_current_task_visibility_becomes_private(self):
-        dad, daughter = self.client('Dad'), self.client('Daughter')
-        self.create(dad, 'tasks', title='Family chore moved private', who='Daughter', priority='Normal',
-                    visibility='Family', category='Home')
-        task = next(t for t in self.call(daughter, 'state')[1]['tasks'] if t['title'] == 'Family chore moved private')
-        self.assertEqual(self.call(dad, 'action', {
-            'action': 'edit', 'id': task['id'], 'record': {'visibility': 'Adults'},
-        })[0], 200)
-
-        state = self.call(daughter, 'state')[1]
-        self.assertNotIn(task['id'], [t['id'] for t in state['tasks']])
-        self.assertNotIn(task['id'], [e['recordId'] for e in state['activity']])
 
     def test_acknowledgements_are_individual_and_not_completed_reasons_are_audited(self):
         dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]

@@ -338,7 +338,7 @@ def generate_reminders(c, profiles, now=None):
         for account in reminder_recipients(record, profiles):
             if account not in profiles:
                 continue
-            if account == "Daughter" and record.get("visibility") != "Family":
+            if not visible(record, account):
                 continue
             if kind == "tasks" and record.get("status") in {"done", "missed"}:
                 continue
@@ -629,17 +629,11 @@ class Handler(BaseHTTPRequestHandler):
                 activity = []
                 for event in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 500"):
                     snapshot = json.loads(event["snapshot"] or "{}")
-                    current_snapshot = snapshot
-                    if event["record_id"]:
+                    if not snapshot and event["record_id"]:
                         record_row = c.execute("SELECT body FROM records WHERE id=?", (event["record_id"],)).fetchone()
-                        if not record_row:
-                            continue
-                        current_snapshot = json.loads(record_row["body"])
-                        if not snapshot:
-                            snapshot = current_snapshot
-                    if not snapshot or not visible(snapshot, name) or not visible(current_snapshot, name):
-                        continue
-                    if name == "Daughter" and (snapshot.get("visibility") != "Family" or current_snapshot.get("visibility") != "Family"):
+                        if record_row:
+                            snapshot = json.loads(record_row["body"])
+                    if not snapshot or not visible(snapshot, name):
                         continue
                     activity.append(activity_entry(event, snapshot, profiles, name))
                     if len(activity) == 50:
@@ -738,7 +732,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not record_row:
                         return self.respond(404, {"error": "Reminder source unavailable"})
                     source = json.loads(record_row["body"])
-                    if not visible(source, name) or name == "Daughter" and source.get("visibility") != "Family":
+                    if not visible(source, name):
                         return self.respond(404, {"error": "Reminder unavailable"})
                     action = payload.get("action")
                     now = stamp()
@@ -944,7 +938,7 @@ class Handler(BaseHTTPRequestHandler):
                             raise ValueError("Cannot check this item")
                         r["checked"] = not r["checked"]
                     else:
-                        if action not in {"edit", "reassigned", "reopen", "recurring_occurrence_edited", "recurring_series_changed"}:
+                        if action not in {"edit", "recurring_occurrence_edited", "recurring_series_changed", "reassigned", "reopen"}:
                             raise ValueError("Unknown action")
                     if kind == "tasks" and action not in {"edit", "recurring_occurrence_edited", "recurring_series_changed", "reassigned", "reopen"}:
                         r["updatedAt"] = stamp()

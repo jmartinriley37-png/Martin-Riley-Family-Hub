@@ -23,7 +23,7 @@ for(const role of ['Dad','Mom','Daughter']){
  }
 }
 vm.runInContext("S.viewer='Dad';render('tasks');openAdd()",context);
-for(const field of ['id=nt','id=ndesc','id=nw','id=np','id=nv','id=nd','id=ntime','id=nc','id=nr','id=na']) assert.ok(app.modal.includes(field),field);
+for(const field of ['id=nt','id=ndesc','id=nw','id=np','id=nv','id=nd','id=ntime','id=nc','id=nr','id=nInterval','id=na']) assert.ok(app.modal.includes(field),field);
 for(const choice of ['Jermaine','Stephanie','Arielle','Everyone','Unassigned','High Priority','Weekdays','Appointments']) assert.ok(app.modal.includes(choice),choice);
 vm.runInContext("S.viewer='Dad';render('home')",context);
 for(const action of ['+ Task','+ Event','+ List Item','+ Note']) assert.ok(app.innerHTML.includes(action),action);
@@ -48,6 +48,12 @@ vm.runInContext("S.viewer='Dad';render('tasks')",context);
 for(const filter of ['Status','Assigned','Priority','Category','Completed','Not Completed']) assert.ok(app.innerHTML.includes(filter),filter);
 vm.runInContext("S.viewer='Daughter';S.tasks=[{id:44,title:'Arielle chore',who:'Daughter',creator:'Dad',priority:'Normal',visibility:'Family',category:'Home',ack:false,acked:[],status:'open'}];render('tasks')",context);
 assert.ok(!app.innerHTML.includes('task-filters')&&app.innerHTML.includes('task-card')&&app.innerHTML.includes('Arielle chore'));
+vm.runInContext("S.viewer='Dad';render('calendar')",context);
+for(const control of ['Month','Agenda','Today','Previous month','Next month']) assert.ok(app.innerHTML.includes(control),control);
+vm.runInContext("S.viewer='Daughter';render('calendar')",context);
+assert.ok(!app.innerHTML.includes('+ Event'));
+vm.runInContext("S.viewer='Dad';render('reminders');render('tomorrow')",context);
+assert.ok(app.innerHTML.includes('Events')&&app.innerHTML.includes('Tasks & chores due'));
 vm.runInContext("S.posts=[{id:1,by:'Mom',text:safeState('<img src=x onerror=alert(1)>'),reacts:{}}];render('board')",context);
 assert.ok(!app.innerHTML.includes('<img src=x'));
 assert.ok(app.innerHTML.includes('&lt;img'));
