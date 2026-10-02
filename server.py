@@ -274,6 +274,73 @@ def dance_record_for_viewer(record, viewer):
         result.pop("financials", None)
     return result
 
+def unlink_dance_references(c, actor, deleted_id, dance_type, changed_at):
+    reference_fields = {
+        "competition": ("competitionIds", "competitionId"),
+        "routine": ("routineIds", "routineId"),
+        "costume": ("costumeIds", "costumeId"),
+        "checklist": ("checklistIds", "checklistId"),
+        "schedule": ("scheduleIds", "scheduleId"),
+    }
+    list_field, scalar_field = reference_fields.get(dance_type, (None, None))
+    if not list_field and not scalar_field:
+        return
+    for linked_row in c.execute("SELECT id,body FROM records WHERE kind='dance' AND deleted=0 AND id<>?", (deleted_id,)).fetchall():
+        linked = json.loads(linked_row["body"])
+        before = {}
+        values = linked.get(list_field) if list_field else None
+        if isinstance(values, list) and deleted_id in values:
+            before[list_field] = values
+            linked[list_field] = [value for value in values if value != deleted_id]
+        if scalar_field and linked.get(scalar_field) == deleted_id:
+            before[scalar_field] = deleted_id
+            linked[scalar_field] = None
+        if before:
+            linked.update(updatedAt=changed_at, updatedBy=actor)
+            c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(linked), linked_row["id"]))
+            audit_record(c, actor, linked_row["id"], "dance_unlinked", {**linked, "id": linked_row["id"]},
+                         {"before": before, "sourceDanceId": deleted_id})
+
+def dance_calendar_mirrors(c, dance_id, include_deleted=False):
+    rows = c.execute("SELECT id,body FROM records WHERE kind='events'" + ("" if include_deleted else " AND deleted=0")).fetchall()
+    return [(row["id"], json.loads(row["body"])) for row in rows if json.loads(row["body"]).get("sourceDanceId") == dance_id]
+
+def set_dance_archived(c, actor, record_id, record, archived):
+    if not adult(actor):
+        raise PermissionError("Only parents can archive or restore Dance records")
+    if record.get("archived", False) == archived:
+        return False
+    changed_at = stamp()
+    record["archived"] = archived
+    if archived:
+        record["archivedAt"] = changed_at
+        record["archivedBy"] = actor
+    else:
+        record["restoredAt"] = changed_at
+        record["restoredBy"] = actor
+    record["updatedAt"] = changed_at
+    record["updatedBy"] = actor
+    c.execute("UPDATE records SET body=? WHERE id=? AND kind='dance' AND deleted=0", (json.dumps(record), record_id))
+    for event_id, event in dance_calendar_mirrors(c, record_id, include_deleted=True):
+        if c.execute("SELECT deleted FROM records WHERE id=?", (event_id,)).fetchone()["deleted"]:
+            continue
+        event["archived"] = archived
+        event["updatedAt"] = changed_at
+        event["updatedBy"] = actor
+        if archived:
+            event["archivedAt"] = changed_at
+            event["archivedBy"] = actor
+            c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (changed_at, event_id))
+        else:
+            event["restoredAt"] = changed_at
+            event["restoredBy"] = actor
+        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(event), event_id))
+    if archived:
+        c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE (source_kind='dance' AND source_id=?) OR (source_kind='events' AND source_id IN (SELECT id FROM records WHERE kind='events' AND json_extract(body,'$.sourceDanceId')=?))",
+                  (changed_at, record_id, record_id))
+    audit_record(c, actor, record_id, "archive" if archived else "restore", {**record, "id": record_id})
+    return True
+
 def family_activity_for_viewer(record, viewer):
     result = dict(record)
     if viewer == "Daughter":
@@ -726,6 +793,8 @@ def generate_reminders(c, profiles, now=None):
     for row in c.execute("SELECT id,kind,body FROM records WHERE deleted=0 AND kind IN ('tasks','events','notes')").fetchall():
         record = json.loads(row["body"])
         kind = row["kind"]
+        if kind == "events" and record.get("sourceDanceId") and record.get("archived"):
+            continue
         reminder_at, due_at = item_reminder_times(record, kind, zone)
         if not reminder_at:
             continue
@@ -839,7 +908,7 @@ def reminder_state(c, account, state):
         source = sources.get((row["source_kind"], row["source_id"]))
         if row["source_kind"] == "recap":
             source = {"title": "Weekly Recap", "category": "Recap", "visibility": "Family"}
-        if not source or row["source_kind"] == "tasks" and source.get("status") in {"done", "missed"} and not row["dismissed_at"]:
+        if not source or source.get("archived") and row["source_kind"] in {"dance", "events"} or row["source_kind"] == "tasks" and source.get("status") in {"done", "missed"} and not row["dismissed_at"]:
             continue
         if row["reminder_type"] in {"task_acknowledgement", "urgent_ack"} and account in source.get("acked", []):
             continue
@@ -868,6 +937,8 @@ def dance_attention_items(account, state):
     attention = {}
     today = local_today()
     for item in state["dance"]:
+        if item.get("archived"):
+            continue
         reasons = []
         actionable_deadlines = []
         target = "Competitions"
@@ -905,7 +976,7 @@ def dance_attention_items(account, state):
         source_id = reminder["sourceId"]
         if source_id not in attention:
             item = next((dance for dance in state["dance"] if dance["id"] == source_id), None)
-            if item:
+            if item and not item.get("archived"):
                 attention[source_id] = {"id": source_id, "title": item.get("title", "Dance item"), "danceType": item.get("danceType"), "reasons": [], "deadlines": [], "target": {"competition": "Competitions", "costume": "Costumes", "checklist": "Dance Checklists", "routine": "Routines", "schedule": "Schedule"}.get(item.get("danceType"), "Dance Home")}
         if source_id in attention and "New update to review" not in attention[source_id]["reasons"]:
             attention[source_id]["reasons"].append("New update to review")
@@ -1132,6 +1203,10 @@ def activity_entry(row, snapshot, profiles, viewer, record_kind=""):
             summary = f"📝 {actor} added a family note"
     elif record_kind == "dance" and action == "deadline_completed":
         summary = f'✅ {actor} completed a competition deadline for "{title}"'
+    elif record_kind == "dance" and action == "archive":
+        summary = f'📦 {actor} archived {snapshot.get("danceType", "dance item")} "{title}"'
+    elif record_kind == "dance" and action == "restore":
+        summary = f'↩️ {actor} restored {snapshot.get("danceType", "dance item")} "{title}"'
     elif record_kind == "activities" and action == "create":
         member = profiles.get(snapshot.get("memberId"), {}).get("displayName", snapshot.get("memberId", "a family member"))
         summary = f"🗓️ {actor} added {member}'s {snapshot.get('activityType', 'activity')} to the family calendar"
@@ -1141,7 +1216,7 @@ def activity_entry(row, snapshot, profiles, viewer, record_kind=""):
     elif record_kind == "activities" and action == "delete":
         member = profiles.get(snapshot.get("memberId"), {}).get("displayName", snapshot.get("memberId", "a family member"))
         summary = f"🗑️ {actor} removed {member}'s {snapshot.get('activityType', 'activity')} schedule"
-    elif record_kind == "dance" and action == "competition_unlinked":
+    elif record_kind == "dance" and action in {"competition_unlinked", "dance_unlinked"}:
         summary = f'🔗 {actor} updated dance links for "{title}"'
     elif action == "checklist_item":
         summary = f'✅ {actor} updated the checklist for "{title}"'
@@ -1286,6 +1361,8 @@ class Handler(BaseHTTPRequestHandler):
                 for row in c.execute("SELECT * FROM records WHERE deleted=0"):
                     record = json.loads(row["body"])
                     record["id"] = row["id"]
+                    if record.get("archived") and (row["kind"] == "events" and record.get("sourceDanceId") or row["kind"] == "dance" and not adult(name)):
+                        continue
                     if visible(record, name):
                         if row["kind"] == "dance":
                             record = dance_record_for_viewer(record, name)
@@ -1307,6 +1384,8 @@ class Handler(BaseHTTPRequestHandler):
                         if record_row:
                             snapshot = json.loads(record_row["body"])
                     if not snapshot or not visible(snapshot, name):
+                        continue
+                    if name == "Daughter" and event["action"] in {"archive", "restore"} and snapshot.get("danceType"):
                         continue
                     activity.append(activity_entry(event, snapshot, profiles, name, record_row["kind"] if record_row else ""))
                     if len(activity) == 50:
@@ -1590,6 +1669,16 @@ class Handler(BaseHTTPRequestHandler):
                                   (rid, start_date, rid))
                         recurring_series_created = True
                         ensure_recurrence_occurrences(c)
+                elif action == "archive_season":
+                    if not adult(name):
+                        return self.respond(403, {"error": "Only parents can archive a Dance season"})
+                    count = 0
+                    for season_row in c.execute("SELECT id,body FROM records WHERE kind='dance' AND deleted=0").fetchall():
+                        season_record = json.loads(season_row["body"])
+                        if season_record.get("danceType") and not season_record.get("archived"):
+                            count += set_dance_archived(c, name, season_row["id"], season_record, True)
+                    c.commit()
+                    return self.respond(200, {"ok": True, "archived": count})
                 else:
                     if type(payload.get("id")) is not int:
                         raise ValueError("Invalid item ID")
@@ -1600,9 +1689,19 @@ class Handler(BaseHTTPRequestHandler):
                     previous = dict(r)
                     if kind == "events" and r.get("sourceDanceId") and action in {"edit", "delete"}:
                         return self.respond(403, {"error": "Edit or delete the source competition to keep its calendar dates in sync"})
+                    if action in {"archive", "restore"}:
+                        if kind != "dance" or not r.get("danceType"):
+                            raise ValueError("Only Dance records can be archived or restored")
+                        if not adult(name):
+                            return self.respond(403, {"error": "Only parents can archive or restore Dance records"})
+                        changed = set_dance_archived(c, name, rid, r, action == "archive")
+                        c.commit()
+                        return self.respond(200, {"ok": True, "changed": changed})
                     if action == "delete":
                         if kind in {"tasks", "events"} and not adult(name):
                             return self.respond(403, {"error": "Only parents can delete tasks and events"})
+                        if kind == "dance" and (not adult(name) or not r.get("danceType")):
+                            return self.respond(403, {"error": "Only parents can delete Dance records"})
                         if not editable(r, name):
                             return self.respond(403, {"error": "You cannot delete this item"})
                         deleted_at = stamp()
@@ -1627,29 +1726,13 @@ class Handler(BaseHTTPRequestHandler):
                             c.execute("UPDATE records SET body=?, deleted=1 WHERE id=?", (json.dumps(target), target_id))
                             c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind=? AND source_id=?", (deleted_at, kind, target_id))
                             audit_record(c, name, target_id, "delete", {**target, "id": target_id}, {"scope": scope})
-                            if kind == "dance" and target.get("danceType") == "competition":
-                                linked_events = c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0").fetchall()
-                                for linked_event in linked_events:
-                                    event = json.loads(linked_event["body"])
-                                    if event.get("sourceDanceId") == target_id:
-                                        event.update(deletedAt=deleted_at, deletedBy=name, updatedAt=deleted_at, updatedBy=name)
-                                        c.execute("UPDATE records SET body=?,deleted=1 WHERE id=?", (json.dumps(event), linked_event["id"]))
-                                        c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (deleted_at, linked_event["id"]))
-                                        audit_record(c, name, linked_event["id"], "delete", {**event, "id": linked_event["id"]}, {"sourceCompetitionId": target_id})
-                                for linked_row in c.execute("SELECT id,body FROM records WHERE kind='dance' AND deleted=0 AND id<>?", (target_id,)).fetchall():
-                                    linked_record = json.loads(linked_row["body"])
-                                    before = {}
-                                    competition_ids = linked_record.get("competitionIds")
-                                    if isinstance(competition_ids, list) and target_id in competition_ids:
-                                        before["competitionIds"] = competition_ids
-                                        linked_record["competitionIds"] = [item for item in competition_ids if item != target_id]
-                                    if linked_record.get("competitionId") == target_id:
-                                        before["competitionId"] = target_id
-                                        linked_record["competitionId"] = None
-                                    if before:
-                                        linked_record.update(updatedAt=deleted_at, updatedBy=name)
-                                        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(linked_record), linked_row["id"]))
-                                        audit_record(c, name, linked_row["id"], "competition_unlinked", {**linked_record, "id": linked_row["id"]}, {"before": before, "competitionId": target_id})
+                            if kind == "dance" and target.get("danceType"):
+                                for event_id, event in dance_calendar_mirrors(c, target_id):
+                                    event.update(deletedAt=deleted_at, deletedBy=name, updatedAt=deleted_at, updatedBy=name)
+                                    c.execute("UPDATE records SET body=?,deleted=1 WHERE id=?", (json.dumps(event), event_id))
+                                    c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (deleted_at, event_id))
+                                    audit_record(c, name, event_id, "delete", {**event, "id": event_id}, {"sourceDanceId": target_id})
+                                unlink_dance_references(c, name, target_id, target.get("danceType"), deleted_at)
                             if kind == "activities":
                                 for linked_event in c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0").fetchall():
                                     if json.loads(linked_event["body"]).get("sourceActivityId") == target_id:
