@@ -32,6 +32,9 @@ class FamilyPrivacyTests(unittest.TestCase):
     def setUp(self):
         with server.connection() as c:
             c.execute("DELETE FROM audit")
+            c.execute("DELETE FROM reminders")
+            c.execute("DELETE FROM recurrence_occurrences")
+            c.execute("DELETE FROM recurrence_series")
             c.execute("DELETE FROM records")
             c.execute("DELETE FROM sessions")
             c.execute("DELETE FROM attempts")
@@ -98,6 +101,103 @@ class FamilyPrivacyTests(unittest.TestCase):
                     self.assertIn('deleted', {row['name'] for row in c.execute('PRAGMA table_info(records)')})
             finally:
                 server.DB = previous_db
+
+    def test_recurrence_dates_handle_weekdays_month_ends_and_leap_years(self):
+        self.assertEqual(server.recurrence_date(Path('2026-10-01').name and __import__('datetime').date(2026, 10, 1), 'Weekly', 2), __import__('datetime').date(2026, 10, 15))
+        self.assertEqual(server.recurrence_date(__import__('datetime').date(2026, 10, 2), 'Weekdays', 1), __import__('datetime').date(2026, 10, 5))
+        self.assertEqual(server.recurrence_date(__import__('datetime').date(2026, 1, 31), 'Monthly', 1), __import__('datetime').date(2026, 2, 28))
+        self.assertEqual(server.recurrence_date(__import__('datetime').date(2026, 1, 31), 'Monthly', 2), __import__('datetime').date(2026, 3, 31))
+        self.assertEqual(server.recurrence_date(__import__('datetime').date(2024, 1, 31), 'Monthly', 1), __import__('datetime').date(2024, 2, 29))
+
+    def test_recurring_tasks_generate_bounded_independent_occurrences(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        start = server.local_today().isoformat()
+        self.create(dad, 'tasks', title='Thursday trash', description='Use outside bin', who='Daughter',
+                    priority='Normal', visibility='Family', category='Home', dueDate=start, repeat='Weekly',
+                    reminderOffsets=[])
+        first_state = self.call(daughter, 'state')[1]
+        occurrences = [t for t in first_state['tasks'] if t['title'] == 'Thursday trash']
+        self.assertGreaterEqual(len(occurrences), 12)
+        self.assertLessEqual(len(occurrences), server.RECURRENCE_MAX_OCCURRENCES + 1)
+        self.assertEqual(occurrences[0]['occurrenceNumber'], 0)
+        self.assertTrue(all(t['status'] == 'open' for t in occurrences))
+        count = len(occurrences)
+        self.assertEqual(len([t for t in self.call(daughter, 'state')[1]['tasks'] if t['title'] == 'Thursday trash']), count)
+        first_id = occurrences[0]['id']
+        self.assertEqual(self.call(daughter, 'action', {'action': 'done', 'id': first_id})[0], 200)
+        after = [t for t in self.call(daughter, 'state')[1]['tasks'] if t['title'] == 'Thursday trash']
+        self.assertEqual(next(t for t in after if t['id'] == first_id)['status'], 'done')
+        self.assertTrue(any(t['status'] == 'open' and t['id'] != first_id for t in after))
+
+    def test_recurring_edit_scopes_preserve_completed_and_other_occurrences(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        start = (server.local_today() + __import__('datetime').timedelta(days=1)).isoformat()
+        self.create(dad, 'tasks', title='Trash rotation', who='Daughter', priority='Normal', visibility='Family',
+                    category='Home', dueDate=start, repeat='Weekly', reminderOffsets=[])
+        occurrences = sorted((t for t in self.call(daughter, 'state')[1]['tasks'] if t['title'] == 'Trash rotation'), key=lambda t: t['occurrenceNumber'])
+        self.assertGreaterEqual(len(occurrences), 12)
+        first, second, third = occurrences[:3]
+        self.assertEqual(self.call(daughter, 'action', {'action': 'done', 'id': first['id']})[0], 200)
+
+        future = {'action': 'edit', 'id': second['id'], 'scope': 'future', 'record': {'title': 'Trash after move'}}
+        self.assertEqual(self.call(dad, 'action', future)[0], 200)
+        after_future = self.call(daughter, 'state')[1]['tasks']
+        self.assertEqual(next(t for t in after_future if t['id'] == first['id'])['title'], 'Trash rotation')
+        self.assertEqual(next(t for t in after_future if t['id'] == second['id'])['title'], 'Trash after move')
+        self.assertEqual(next(t for t in after_future if t['id'] == third['id'])['title'], 'Trash after move')
+
+        single = {'action': 'edit', 'id': second['id'], 'scope': 'this', 'record': {'description': 'Only this week'}}
+        self.assertEqual(self.call(dad, 'action', single)[0], 200)
+        after_single = self.call(daughter, 'state')[1]['tasks']
+        self.assertEqual(next(t for t in after_single if t['id'] == second['id'])['description'], 'Only this week')
+        self.assertNotEqual(next(t for t in after_single if t['id'] == third['id']).get('description'), 'Only this week')
+
+        whole = {'action': 'edit', 'id': second['id'], 'scope': 'series', 'record': {'title': 'Whole series name'}}
+        self.assertEqual(self.call(dad, 'action', whole)[0], 200)
+        after_series = self.call(daughter, 'state')[1]['tasks']
+        self.assertEqual(next(t for t in after_series if t['id'] == first['id'])['title'], 'Trash rotation')
+        self.assertEqual(next(t for t in after_series if t['id'] == second['id'])['title'], 'Whole series name')
+        self.assertEqual(next(t for t in after_series if t['id'] == third['id'])['title'], 'Whole series name')
+
+    def test_calendar_event_visibility_and_profile_privacy(self):
+        dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]
+        event = {'title': 'Arielle dance practice', 'description': 'Studio A', 'date': server.local_today().isoformat(),
+                 'startTime': '17:00', 'endTime': '18:00', 'allDay': False, 'location': 'Studio',
+                 'category': 'Dance', 'who': 'Daughter', 'people': ['Daughter'], 'visibility': 'Family',
+                 'repeat': 'One Time', 'reminderOffsets': []}
+        self.create(dad, 'events', **event)
+        self.create(dad, 'events', title='Adult appointment', date=server.local_today().isoformat(),
+                    category='Appointments', visibility='Adults', who='Dad', allDay=True, reminderOffsets=[])
+        self.create(dad, 'events', title='Jermaine private', date=server.local_today().isoformat(),
+                    category='Work', visibility='Me', who='Dad', allDay=True, reminderOffsets=[])
+        self.create(mom, 'events', title='Stephanie private', date=server.local_today().isoformat(),
+                    category='Appointments', visibility='Me', who='Mom', allDay=True, reminderOffsets=[])
+        self.assertIn('Arielle dance practice', [e['title'] for e in self.call(daughter, 'state')[1]['events']])
+        daughter_titles = [e['title'] for e in self.call(daughter, 'state')[1]['events']]
+        self.assertNotIn('Adult appointment', daughter_titles)
+        self.assertNotIn('Jermaine private', daughter_titles)
+        self.assertNotIn('Stephanie private', daughter_titles)
+        self.assertNotIn('Jermaine private', [e['title'] for e in self.call(mom, 'state')[1]['events']])
+        self.assertNotIn('Stephanie private', [e['title'] for e in self.call(dad, 'state')[1]['events']])
+
+    def test_reminder_generation_is_deduplicated_and_actions_are_private(self):
+        dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]
+        due_date = server.local_today().isoformat()
+        self.create(dad, 'tasks', title='Urgent private chore', who='Daughter', priority='Urgent',
+                    visibility='Family', category='Home', dueDate=due_date, dueTime='00:01', reminderOffsets=[0])
+        daughter_state = self.call(daughter, 'state')[1]
+        reminders = [r for r in daughter_state['reminders'] if r['title'] == 'Urgent private chore']
+        self.assertTrue(any(r['type'] == 'urgent_ack' for r in reminders))
+        self.assertTrue(any(r['type'] == 'overdue' for r in reminders))
+        self.assertEqual(self.call(daughter, 'state')[1]['reminders'] and len([r for r in self.call(daughter, 'state')[1]['reminders'] if r['title'] == 'Urgent private chore']), len(reminders))
+        reminder = next(r for r in reminders if r['type'] == 'urgent_ack')
+        self.assertEqual(self.call(mom, 'reminders/action', {'id': reminder['id'], 'action': 'dismiss'})[0], 404)
+        self.assertEqual(self.call(daughter, 'reminders/action', {'id': reminder['id'], 'action': 'snooze', 'minutes': 30})[0], 200)
+        snoozed = next(r for r in self.call(daughter, 'state')[1]['reminders'] if r['id'] == reminder['id'])
+        self.assertTrue(snoozed['snoozed'])
+        self.assertEqual(self.call(daughter, 'reminders/action', {'id': reminder['id'], 'action': 'dismiss'})[0], 200)
+        dismissed = next(r for r in self.call(daughter, 'state')[1]['reminders'] if r['id'] == reminder['id'])
+        self.assertTrue(dismissed['dismissed'])
 
     def test_visibility_and_history_never_leak(self):
         dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]
@@ -177,6 +277,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertTrue(completed['completedAt'])
         self.assertEqual(completed['completionHistory'][0]['completedBy'], 'Daughter')
         self.assertEqual(self.call(daughter, 'state')[1]['points'], 1)
+        self.assertEqual(self.call(daughter, 'state')[1]['streak'], 1)
         self.assertIn('✅ Arielle completed "Take out trash"', [e['summary'] for e in self.call(mom, 'state')[1]['activity']])
 
         self.assertEqual(self.call(dad, 'action', {'action': 'reopen', 'id': task_id})[0], 200)
@@ -230,6 +331,19 @@ class FamilyPrivacyTests(unittest.TestCase):
         edit = next(e for e in state['activity'] if e['recordId'] == task['id'] and e['action'] == 'edit')
         self.assertEqual(edit['details'], {})
         self.assertNotIn('Private calendar details', json.dumps(state['activity']))
+
+    def test_activity_is_hidden_when_current_task_visibility_becomes_private(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        self.create(dad, 'tasks', title='Family chore moved private', who='Daughter', priority='Normal',
+                    visibility='Family', category='Home')
+        task = next(t for t in self.call(daughter, 'state')[1]['tasks'] if t['title'] == 'Family chore moved private')
+        self.assertEqual(self.call(dad, 'action', {
+            'action': 'edit', 'id': task['id'], 'record': {'visibility': 'Adults'},
+        })[0], 200)
+
+        state = self.call(daughter, 'state')[1]
+        self.assertNotIn(task['id'], [t['id'] for t in state['tasks']])
+        self.assertNotIn(task['id'], [e['recordId'] for e in state['activity']])
 
     def test_acknowledgements_are_individual_and_not_completed_reasons_are_audited(self):
         dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]

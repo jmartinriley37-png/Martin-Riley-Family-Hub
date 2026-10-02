@@ -27,6 +27,8 @@ for(const field of ['id=nt','id=ndesc','id=nw','id=np','id=nv','id=nd','id=ntime
 for(const choice of ['Jermaine','Stephanie','Arielle','Everyone','Unassigned','High Priority','Weekdays','Appointments']) assert.ok(app.modal.includes(choice),choice);
 vm.runInContext("S.viewer='Dad';render('home')",context);
 for(const action of ['+ Task','+ Event','+ List Item','+ Note']) assert.ok(app.innerHTML.includes(action),action);
+vm.runInContext("S.activity=[{summary:'✅ Arielle completed \\\"Take out trash\\\"',createdAt:'2026-10-02T00:02:00Z'}];render('home')",context);
+assert.ok(app.innerHTML.includes('Recent Activity')&&app.innerHTML.includes('Arielle completed'));
 vm.runInContext("S.viewer='Daughter';render('home');render('ask')",context);
 assert.ok(!app.innerHTML.includes('+ Task'));
 assert.ok(app.innerHTML.includes('Ask Jermaine &amp; Stephanie')||app.innerHTML.includes('Ask Jermaine & Stephanie'));
