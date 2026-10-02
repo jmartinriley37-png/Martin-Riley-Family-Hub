@@ -309,7 +309,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         ds = self.call(daughter, 'state')[1]
         self.assertEqual([n['text'] for n in ds['notes']], ['shared'])
         self.assertEqual(len(ds['activity']), 1)
-        self.assertIn('Jermaine created', ds['activity'][0]['summary'])
+        self.assertIn('Jermaine added a family note', ds['activity'][0]['summary'])
         ms = self.call(mom, 'state')[1]
         self.assertEqual({n['text'] for n in ms['notes']}, {'shared','adult-secret','mom-secret'})
         secret = next(n for n in self.call(dad,'state')[1]['notes'] if n['text']=='dad-secret')
@@ -425,6 +425,242 @@ class FamilyPrivacyTests(unittest.TestCase):
             self.assertEqual(self.call(client, 'action', {'action': 'edit', 'id': mom_task['id'], 'record': {'title': 'Leaked'}})[0], 404)
             self.assertEqual(self.call(client, 'action', {'action': 'delete', 'id': mom_task['id']})[0], 404)
 
+    def test_adult_vault_notes_are_shared_only_with_adults_server_side(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        reminder_date = (server.local_today() - __import__('datetime').timedelta(days=2)).isoformat()
+        status, response = self.call(dad, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Vault', 'visibility': 'Family', 'title': 'Vault emergency contacts',
+            'category': 'Emergency Information', 'notes': 'Family doctor phone ending 1234.',
+            'date': server.local_today().isoformat(), 'reminderDate': reminder_date, 'reminderOffsets': [0],
+        }})
+        self.assertEqual(status, 200, response)
+        vault = next(item for item in self.call(dad, 'state')[1]['notes'] if item.get('title') == 'Vault emergency contacts')
+        self.assertEqual((vault['space'], vault['visibility'], vault['category']), ('Vault', 'Adults', 'Emergency Information'))
+        for parent in (dad, mom):
+            state = self.call(parent, 'state')[1]
+            parent_vault = next(item for item in state['notes'] if item['id'] == vault['id'])
+            self.assertEqual(parent_vault['notes'], 'Family doctor phone ending 1234.')
+            self.assertTrue(any(item['sourceKind'] == 'notes' and item['sourceId'] == vault['id'] for item in state['reminders']))
+            self.assertEqual(state['badgeCounts']['vault'], 1)
+        daughter_state = self.call(daughter, 'state')[1]
+        for secret in ('Vault emergency contacts', 'Family doctor phone ending 1234.', 'Emergency Information', '1234'):
+            self.assertNotIn(secret, json.dumps(daughter_state))
+        self.assertFalse(any(item['sourceKind'] == 'notes' for item in daughter_state['reminders']))
+        self.assertEqual(daughter_state['badgeCounts'].get('vault', 0), 0)
+        self.assertNotIn('Vault emergency contacts', json.dumps(daughter_state['activity']))
+        self.assertEqual(self.call(daughter, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Vault', 'visibility': 'Family', 'title': 'Arielle forged vault entry',
+        }})[0], 403)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'edit', 'id': vault['id'], 'record': {'title': 'Leaked'}})[0], 404)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'delete', 'id': vault['id']})[0], 404)
+        self.assertEqual(self.call(mom, 'action', {'action': 'edit', 'id': vault['id'], 'record': {'notes': 'Updated by Stephanie'}})[0], 200)
+        with server.connection() as db:
+            cursor = db.execute('INSERT INTO records(kind,body) VALUES(?,?)', ('notes', json.dumps({
+                'space': 'Vault', 'visibility': 'Family', 'title': 'Malformed legacy private vault note',
+                'category': 'Other', 'notes': 'Must remain hidden regardless of visibility.' , 'creator': 'Dad',
+            })))
+            malformed_id = cursor.lastrowid
+        malformed_daughter_state = self.call(daughter, 'state')[1]
+        self.assertNotIn('Malformed legacy private vault note', json.dumps(malformed_daughter_state))
+        self.assertEqual(malformed_daughter_state['badgeCounts'].get('vault', 0), 0)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'edit', 'id': malformed_id, 'record': {'notes': 'leak'}})[0], 404)
+        self.create(dad, 'notes', space='Me', visibility='Family', title='Dad counts only his own private reminder',
+                category='Personal', notes='Owner-only', reminderDate=reminder_date, reminderOffsets=[0])
+        dad_state = self.call(dad, 'state')[1]
+        mom_state = self.call(mom, 'state')[1]
+        self.assertEqual(dad_state['badgeCounts']['private'], 1)
+        self.assertEqual(mom_state['badgeCounts']['private'], 0)
+
+    def test_me_only_notes_cannot_be_read_modified_or_inferred_by_other_accounts(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        daughter_reminders_before = self.call(daughter, 'state')[1]['badgeCounts']['reminders']
+        dad_reminder = (server.local_today() - __import__('datetime').timedelta(days=2)).isoformat()
+        mom_reminder = (server.local_today() - __import__('datetime').timedelta(days=3)).isoformat()
+        dad_status, dad_response = self.call(dad, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Me', 'visibility': 'Family', 'title': 'Jermaine private work note',
+            'category': 'Work', 'notes': 'Jermaine private contents.', 'date': server.local_today().isoformat(),
+            'reminderDate': dad_reminder, 'reminderOffsets': [0],
+        }})
+        mom_status, mom_response = self.call(mom, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Me', 'visibility': 'Family', 'title': 'Stephanie personal appointment',
+            'category': 'Appointment', 'notes': 'Stephanie private contents.', 'date': server.local_today().isoformat(),
+            'reminderDate': mom_reminder, 'reminderOffsets': [0],
+        }})
+        self.assertEqual((dad_status, mom_status), (200, 200), (dad_response, mom_response))
+        dad_state = self.call(dad, 'state')[1]
+        mom_state = self.call(mom, 'state')[1]
+        dad_note = next(item for item in dad_state['notes'] if item.get('title') == 'Jermaine private work note')
+        mom_note = next(item for item in mom_state['notes'] if item.get('title') == 'Stephanie personal appointment')
+        self.assertEqual((dad_note['space'], dad_note['visibility']), ('Me', 'Me'))
+        self.assertEqual((mom_note['space'], mom_note['visibility']), ('Me', 'Me'))
+        self.assertEqual(dad_state['badgeCounts']['private'], 1)
+        self.assertEqual(mom_state['badgeCounts']['private'], 1)
+        self.assertTrue(any(item['sourceKind'] == 'notes' and item['sourceId'] == dad_note['id'] for item in dad_state['reminders']))
+        self.assertTrue(any(item['sourceKind'] == 'notes' and item['sourceId'] == mom_note['id'] for item in mom_state['reminders']))
+        old_dad_reminder = next(item for item in dad_state['reminders'] if item['sourceKind'] == 'notes' and item['sourceId'] == dad_note['id'])
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': dad_note['id'], 'record': {'notes': 'Jermaine updated his own note'}})[0], 200)
+        self.assertEqual(self.call(mom, 'action', {'action': 'edit', 'id': mom_note['id'], 'record': {'notes': 'Stephanie updated her own note'}})[0], 200)
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': mom_note['id'], 'record': {'title': 'Stolen'}})[0], 404)
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': mom_note['id']})[0], 404)
+        self.assertEqual(self.call(mom, 'action', {'action': 'edit', 'id': dad_note['id'], 'record': {'title': 'Stolen'}})[0], 404)
+        self.assertEqual(self.call(mom, 'action', {'action': 'delete', 'id': dad_note['id']})[0], 404)
+        new_reminder_date = (server.local_today() + __import__('datetime').timedelta(days=2)).isoformat()
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': dad_note['id'], 'record': {'reminderDate': new_reminder_date}})[0], 200)
+        dad_state_after_reminder_edit = self.call(dad, 'state')[1]
+        self.assertTrue(next(item for item in dad_state_after_reminder_edit['reminders'] if item['id'] == old_dad_reminder['id'])['dismissed'])
+        self.assertEqual(sum(item['sourceKind'] == 'notes' and item['sourceId'] == dad_note['id'] and not item['dismissed'] for item in dad_state_after_reminder_edit['reminders']), 0)
+        mom_state = self.call(mom, 'state')[1]
+        daughter_state = self.call(daughter, 'state')[1]
+        for private_text in ('Jermaine private work note', 'Jermaine private contents.'):
+            self.assertNotIn(private_text, json.dumps(mom_state))
+        self.assertEqual(mom_state['badgeCounts']['private'], 1)
+        for private_text in ('Jermaine private work note', 'Jermaine private contents.', 'Stephanie personal appointment', 'Stephanie private contents.'):
+            self.assertNotIn(private_text, json.dumps(daughter_state))
+        self.assertEqual(daughter_state['badgeCounts']['private'], 0)
+        self.assertEqual(daughter_state['badgeCounts']['reminders'], daughter_reminders_before)
+        self.assertIn('Jermaine private work note', json.dumps(self.call(dad, 'state')[1]))
+        self.assertIn('Stephanie personal appointment', json.dumps(mom_state))
+        daughter_status, daughter_response = self.call(daughter, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Me', 'visibility': 'Family', 'title': 'Arielle own private note', 'category': 'Idea',
+            'notes': 'Only Arielle can see this.', 'reminderDate': dad_reminder, 'reminderOffsets': [0],
+        }})
+        self.assertEqual(daughter_status, 200, daughter_response)
+        daughter_state = self.call(daughter, 'state')[1]
+        self.assertIn('Arielle own private note', json.dumps(daughter_state))
+        self.assertEqual(daughter_state['badgeCounts']['private'], 1)
+        for viewer in (dad, mom):
+            self.assertNotIn('Arielle own private note', json.dumps(self.call(viewer, 'state')[1]))
+
+    def test_maddox_is_managed_profile_without_account_and_activity_uses_family_calendar(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        dad_state = self.call(dad, 'state')[1]
+        self.assertEqual(dad_state['familyMembers']['Maddox'], {
+            'memberId': 'Maddox', 'displayName': 'Maddox', 'profileType': 'managed_child',
+            'role': 'MANAGED CHILD PROFILE', 'hasAccount': False, 'managedBy': ['Dad', 'Mom'], 'avatar': '⚾',
+        })
+        self.assertNotIn('Maddox', dad_state['profiles'])
+        with server.connection() as db:
+            self.assertIsNone(db.execute("SELECT name FROM users WHERE name='Maddox'").fetchone())
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM sessions s JOIN users u ON u.name=s.name WHERE u.name='Maddox'").fetchone()[0], 0)
+            db.execute("INSERT INTO family_members(member_id,display_name,member_type,account_name,managed_by,avatar) VALUES(?,?,?,NULL,?,?)",
+                       ('ManagedChildTwo', 'Future Child', 'managed_child', json.dumps(['Dad', 'Mom']), '🏀'))
+        self.assertNotEqual(self.call({}, 'login', {'name': 'Maddox', 'password': 'testing-password'})[0], 200)
+
+        activity_date = (server.local_today() + __import__('datetime').timedelta(days=1)).isoformat()
+        status, response = self.call(dad, 'action', {'action': 'create', 'kind': 'activities', 'record': {
+            'memberId': 'Maddox', 'activityName': 'Baseball', 'activityType': 'Baseball',
+            'organization': 'Little League', 'season': 'Fall 2026', 'eventType': 'Practice',
+            'date': activity_date, 'startTime': '17:30', 'endTime': '18:30',
+            'location': 'North Field', 'equipmentNotes': 'Bring glove, cleats and water bottle',
+            'parentNotes': 'Coach asks players to arrive early', 'reminderOffsets': [1440],
+        }})
+        self.assertEqual(status, 200, response)
+        second_status, second_response = self.call(dad, 'action', {'action': 'create', 'kind': 'activities', 'record': {
+            'memberId': 'ManagedChildTwo', 'activityName': 'Camp', 'activityType': 'Camp',
+            'eventType': 'Camp', 'date': activity_date, 'location': 'Community Center',
+        }})
+        self.assertEqual(second_status, 200, second_response)
+        activity = next(item for item in self.call(dad, 'state')[1]['activities'] if item['activityName'] == 'Baseball')
+        self.assertEqual(activity['memberId'], 'Maddox')
+        self.assertFalse(self.call(dad, 'state')[1]['familyMembers']['ManagedChildTwo']['hasAccount'])
+        self.assertTrue(any(item['memberId'] == 'ManagedChildTwo' for item in self.call(dad, 'state')[1]['activities']))
+        self.assertEqual(self.call(daughter, 'action', {'action': 'create', 'kind': 'activities', 'record': {
+            'memberId': 'Maddox', 'activityName': 'Unauthorized', 'activityType': 'Camp', 'date': activity_date,
+        }})[0], 403)
+        for client in (dad, mom, daughter):
+            state = self.call(client, 'state')[1]
+            linked = [event for event in state['events'] if event.get('sourceActivityId') == activity['id']]
+            self.assertEqual(len(linked), 1)
+            self.assertEqual((linked[0]['date'], linked[0]['startTime'], linked[0]['location']), (activity_date, '17:30', 'North Field'))
+            self.assertIn('Maddox', linked[0]['people'])
+            self.assertIn('Bring glove, cleats and water bottle', linked[0]['description'])
+            self.assertNotIn('Coach asks players to arrive early', linked[0]['description'])
+            self.assertNotIn('Maddox', state['profiles'])
+        self.assertIn('Coach asks players to arrive early', json.dumps(self.call(dad, 'state')[1]['activities']))
+        self.assertNotIn('Coach asks players to arrive early', json.dumps(self.call(daughter, 'state')[1]['activities']))
+        daughter_state = self.call(daughter, 'state')[1]
+        self.assertTrue(any(reminder['sourceKind'] == 'events' and reminder['sourceId'] == next(event['id'] for event in daughter_state['events'] if event.get('sourceActivityId') == activity['id']) for reminder in daughter_state['reminders']))
+
+        self.create(dad, 'tasks', title='Pack Maddox glove', who='Maddox', visibility='Family', category='Home', ack=True, priority='Urgent')
+        parent_task = next(task for task in self.call(dad, 'state')[1]['tasks'] if task['title'] == 'Pack Maddox glove')
+        self.assertEqual(parent_task['who'], 'Maddox')
+        self.assertFalse(parent_task['ack'])
+        self.assertFalse(parent_task['chore'])
+        self.assertTrue(any(task['id'] == parent_task['id'] for task in self.call(daughter, 'state')[1]['tasks']))
+        self.assertEqual(self.call(daughter, 'action', {'action': 'ack', 'id': parent_task['id']})[0], 403)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'done', 'id': parent_task['id']})[0], 403)
+        self.assertEqual(self.call({}, 'action', {'action': 'done', 'id': parent_task['id']})[0], 401)
+        self.assertEqual(self.call(dad, 'action', {'action': 'done', 'id': parent_task['id'], 'manager': True})[0], 200)
+
+        later_date = (server.local_today() + __import__('datetime').timedelta(days=3)).isoformat()
+        self.assertEqual(self.call(mom, 'action', {'action': 'edit', 'id': activity['id'], 'record': {
+            'date': later_date, 'location': 'South Field', 'parentNotes': 'Arielle must not see parent-only arrival details',
+        }})[0], 200)
+        updated_events = [event for event in self.call(daughter, 'state')[1]['events'] if event.get('sourceActivityId') == activity['id']]
+        self.assertEqual(len(updated_events), 1)
+        self.assertEqual((updated_events[0]['date'], updated_events[0]['location']), (later_date, 'South Field'))
+        daughter_state = self.call(daughter, 'state')[1]
+        self.assertNotIn('Arielle must not see parent-only arrival details', json.dumps(daughter_state))
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': activity['id']})[0], 200)
+        self.assertFalse(any(event.get('sourceActivityId') == activity['id'] for event in self.call(daughter, 'state')[1]['events']))
+        self.assertNotIn('Maddox', self.call(daughter, 'profiles')[1]['profiles'])
+
+    def test_adult_vault_is_shared_by_parents_and_absent_from_daughter_state(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        today = server.local_today().isoformat()
+        response_status, response = self.call(dad, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Vault', 'visibility': 'Family', 'title': 'Emergency contact notes',
+            'category': 'Emergency Information', 'notes': 'Call the family doctor.',
+            'date': today, 'reminderDate': today, 'reminderOffsets': [0],
+        }})
+        self.assertEqual(response_status, 200, response)
+        vault = next(item for item in self.call(dad, 'state')[1]['notes'] if item.get('title') == 'Emergency contact notes')
+        self.assertEqual((vault['space'], vault['visibility'], vault['category']), ('Vault', 'Adults', 'Emergency Information'))
+        for parent in (dad, mom):
+            self.assertIn('Emergency contact notes', [item.get('title') for item in self.call(parent, 'state')[1]['notes']])
+            self.assertTrue(any(item['sourceKind'] == 'notes' and item['sourceId'] == vault['id'] for item in self.call(parent, 'state')[1]['reminders']))
+
+        daughter_state = self.call(daughter, 'state')[1]
+        payload = json.dumps(daughter_state)
+        for private_value in ('Emergency contact notes', 'Call the family doctor.', 'Emergency Information'):
+            self.assertNotIn(private_value, payload)
+        self.assertFalse(any(item['sourceKind'] == 'notes' for item in daughter_state['reminders']))
+        self.assertEqual(self.call(daughter, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Vault', 'visibility': 'Family', 'title': 'Forged Vault note', 'notes': 'No access',
+        }})[0], 403)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'edit', 'id': vault['id'], 'record': {'title': 'Leaked'}})[0], 404)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'delete', 'id': vault['id']})[0], 404)
+
+    def test_me_only_notes_are_creator_only_for_reads_writes_badges_and_history(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        dad_status, dad_response = self.call(dad, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Me', 'visibility': 'Family', 'title': 'Jermaine private appointment',
+            'category': 'Appointment', 'notes': 'Private doctor visit.',
+        }})
+        mom_status, mom_response = self.call(mom, 'action', {'action': 'create', 'kind': 'notes', 'record': {
+            'space': 'Me', 'visibility': 'Family', 'title': 'Stephanie private work note',
+            'category': 'Work', 'notes': 'Private work details.',
+        }})
+        self.assertEqual((dad_status, mom_status), (200, 200), (dad_response, mom_response))
+        dad_note = next(item for item in self.call(dad, 'state')[1]['notes'] if item.get('title') == 'Jermaine private appointment')
+        mom_note = next(item for item in self.call(mom, 'state')[1]['notes'] if item.get('title') == 'Stephanie private work note')
+        self.assertEqual((dad_note['space'], dad_note['visibility']), ('Me', 'Me'))
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': dad_note['id'], 'record': {'notes': 'Updated by owner'}})[0], 200)
+        self.assertEqual(self.call(mom, 'action', {'action': 'edit', 'id': dad_note['id'], 'record': {'title': 'Stolen'}})[0], 404)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'delete', 'id': dad_note['id']})[0], 404)
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': mom_note['id'], 'record': {'title': 'Stolen'}})[0], 404)
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': mom_note['id']})[0], 404)
+
+        dad_payload = json.dumps(self.call(dad, 'state')[1])
+        mom_payload = json.dumps(self.call(mom, 'state')[1])
+        daughter_payload = json.dumps(self.call(daughter, 'state')[1])
+        self.assertIn('Jermaine private appointment', dad_payload)
+        self.assertNotIn('Stephanie private work note', dad_payload)
+        self.assertIn('Stephanie private work note', mom_payload)
+        self.assertNotIn('Jermaine private appointment', mom_payload)
+        for private_text in ('Jermaine private appointment', 'Private doctor visit.', 'Stephanie private work note', 'Private work details.'):
+            self.assertNotIn(private_text, daughter_payload)
+
     def test_activity_does_not_leak_previous_private_task_values(self):
         dad, daughter = self.client('Dad'), self.client('Daughter')
         self.create(dad, 'tasks', title='Private appointment', description='Private calendar details',
@@ -434,9 +670,29 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': task['id'], 'record': {'visibility': 'Family'}})[0], 200)
         state = self.call(daughter, 'state')[1]
         self.assertIn('Private appointment', [t['title'] for t in state['tasks']])
-        edit = next(e for e in state['activity'] if e['recordId'] == task['id'] and e['action'] == 'edit')
-        self.assertEqual(edit['details'], {})
+        edit = next(e for e in state['activity'] if 'edited "Private appointment"' in e['summary'])
+        self.assertNotIn('recordId', edit)
+        self.assertNotIn('action', edit)
+        self.assertNotIn('details', edit)
         self.assertNotIn('Private calendar details', json.dumps(state['activity']))
+
+    def test_family_activity_hides_audit_identifiers_and_friendly_labels_internal_actions(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        self.create(dad, 'dance', title='Solo Routine', danceType='routine')
+        routine = next(item for item in self.call(dad, 'state')[1]['dance'] if item['title'] == 'Solo Routine')
+        with server.connection() as db:
+            server.audit_record(db, 'Dad', routine['id'], 'competition_unlinked',
+                                {**routine, 'id': routine['id']},
+                                {'competitionId': 987654, 'before': {'parentNotes': 'Never show this private audit detail'}})
+        child_state = self.call(daughter, 'state')[1]
+        activity = next(item for item in child_state['activity'] if 'dance links' in item['summary'])
+        for internal_field in ('id', 'recordId', 'actor', 'action', 'details'):
+            self.assertNotIn(internal_field, activity)
+        for internal_value in ('competition_unlinked', 'competitionId', '987654', 'Never show this private audit detail'):
+            self.assertNotIn(internal_value, json.dumps(child_state['activity']))
+        parent_state = self.call(dad, 'state')[1]
+        parent_summary = next(item['summary'] for item in parent_state['activity'] if 'dance links' in item['summary'])
+        self.assertNotIn('competition_unlinked', parent_summary)
 
     def test_acknowledgements_are_individual_and_not_completed_reasons_are_audited(self):
         dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]

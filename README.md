@@ -22,12 +22,19 @@ the ZIP. The archive remains unchanged as the historical prototype.
 - Bulletin Board with per-person toggled reactions.
 - Shared Calendar with dated events, competition dates/deadlines, and
   privacy-filtered Tomorrow Prep for schedule, tasks, packing, and reminders.
+- Managed child profiles are separate from login accounts; Maddox has parent-managed
+  activities and sports linked to Family Calendar without credentials or sessions.
 - Shared checklist items; Dance Hub with separate Competitions, Schedule,
--  Routines, Costumes, and Dance Checklists sections, including routine and
+  Routines, Costumes, and Dance Checklists sections, including routine and
   costume associations, competition schedule status, travel details, and
   individually checkable packing lists.
 - Parent-issued positive recognition for Arielle's completed work.
 - Adult Vault notes and Me Only notes; private activity history.
+- Adult Vault entries shared only by the adults and separate, creator-only Me Only
+  notes, with optional date reminders. Adult Vault is not a password manager;
+  never store passwords, PINs, full SSNs, full payment-card numbers, or auth secrets.
+- Adult Access & Privacy dashboard with account/area permissions and conservative
+  read-only ChatGPT defaults.
 - In-app reminders for open High/Urgent tasks.
 - Per-user numbered badges for unseen and actionable tasks, requests, board posts,
   dance/calendar updates, shared lists, weekly recap, recognition, and reminders.

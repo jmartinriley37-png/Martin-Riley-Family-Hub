@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 ROOT = Path(__file__).parent
 DB = os.environ.get("HUB_DB", str(ROOT / "data" / "hub.sqlite3"))
 HUB_TIMEZONE = os.environ.get("HUB_TIMEZONE", "UTC")
-KINDS = {"tasks", "posts", "requests", "events", "lists", "dance", "notes", "recognitions"}
+KINDS = {"tasks", "posts", "requests", "events", "lists", "dance", "notes", "recognitions", "activities"}
 VISIBILITY = {"Family", "Adults", "Assigned", "Me"}
 ACCOUNT_ROLES = {"Dad": "ADMIN", "Mom": "ADMIN", "Daughter": "CHILD"}
 DEFAULT_DISPLAY_NAMES = {"Dad": "Jermaine", "Mom": "Stephanie", "Daughter": "Arielle"}
@@ -31,6 +31,8 @@ TASK_MISS_REASONS = {"Ran out of time", "Waiting on someone/something", "Resched
 EVENT_CATEGORIES = {"Family", "Appointments", "School", "Dance", "Work", "Birthdays", "Travel", "Competitions", "Other"}
 REQUEST_TYPES = {"Permission", "Purchase", "Ride", "Sleepover/Friend", "Schedule Change", "Chore/Task", "Question", "Other"}
 REMINDER_OFFSETS = {0, 15, 30, 60, 120, 1440}
+VAULT_CATEGORIES = {"Important Information", "Household", "Bills / Financial Notes", "Insurance", "Vehicles", "Home", "Travel", "Emergency Information", "Important Contacts", "Other"}
+ME_CATEGORIES = {"Personal", "Work", "Reminder", "Idea", "Appointment", "Other"}
 RECURRENCE_HORIZON_DAYS = 90
 RECURRENCE_MAX_OCCURRENCES = 120
 STATIC = {"index.html", "styles.css", "app.js", "manifest.json", "sw.js", "icon.svg", "icon-192.png", "icon-512.png"}
@@ -42,6 +44,7 @@ DANCE_FIELDS = (
     "ordered", "received", "alterationsNeeded", "alterationsCompleted", "accessories", "shoes", "deadlines",
     "tights", "neededBy", "checklistItems", "competitionId", "fees", "financials", "notes",
 )
+ACTIVITY_FIELDS = ("memberId", "activityName", "activityType", "organization", "season", "eventType", "date", "startTime", "endTime", "location", "equipmentNotes", "parentNotes", "reminderOffsets", "visibility")
 
 def connection():
     Path(DB).parent.mkdir(parents=True, exist_ok=True)
@@ -64,6 +67,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL REFERENCES users(name), source_kind TEXT NOT NULL, source_id INTEGER NOT NULL, reminder_key TEXT NOT NULL, reminder_type TEXT NOT NULL, due_at TEXT NOT NULL, created_at TEXT NOT NULL, read_at TEXT, dismissed_at TEXT, snoozed_until TEXT, UNIQUE(account, source_kind, source_id, reminder_key));
         CREATE TABLE IF NOT EXISTS recognition_receipts(recognition_id INTEGER NOT NULL REFERENCES records(id), recipient TEXT NOT NULL REFERENCES users(name), seen_at TEXT NOT NULL, PRIMARY KEY(recognition_id, recipient));
         CREATE TABLE IF NOT EXISTS notification_settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS family_members(member_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, member_type TEXT NOT NULL, account_name TEXT UNIQUE REFERENCES users(name), managed_by TEXT NOT NULL DEFAULT '[]', avatar TEXT NOT NULL DEFAULT '');
         """)
         columns = {row["name"] for row in c.execute("PRAGMA table_info(users)")}
         if "display_name" not in columns:
@@ -81,6 +85,12 @@ def initialize():
             c.execute("ALTER TABLE recurrence_series ADD COLUMN created_by TEXT NOT NULL DEFAULT ''")
         if "anchor_sequence" not in series_columns:
             c.execute("ALTER TABLE recurrence_series ADD COLUMN anchor_sequence INTEGER NOT NULL DEFAULT 0")
+        for account, display_name in DEFAULT_DISPLAY_NAMES.items():
+            if c.execute("SELECT 1 FROM users WHERE name=?", (account,)).fetchone():
+                c.execute("INSERT OR IGNORE INTO family_members(member_id,display_name,member_type,account_name) VALUES(?,?,'account',?)", (account, display_name, account))
+                c.execute("UPDATE family_members SET display_name=? WHERE member_id=? AND account_name=?", (display_name, account, account))
+        c.execute("INSERT OR IGNORE INTO family_members(member_id,display_name,member_type,account_name,managed_by,avatar) VALUES('Maddox','Maddox','managed_child',NULL,?,?)",
+                  (json.dumps(["Dad", "Mom"]), "⚾"))
         c.execute("INSERT OR IGNORE INTO notification_settings(name,value) VALUES('audit_notifications_started_at',?)", (stamp(),))
         latest_audit_id = c.execute("SELECT COALESCE(MAX(id),0) FROM audit").fetchone()[0]
         c.execute("INSERT OR IGNORE INTO notification_settings(name,value) VALUES('audit_notification_last_id',?)", (str(latest_audit_id),))
@@ -109,6 +119,32 @@ def profile_data(c):
         }
         for row in c.execute("SELECT name, display_name FROM users")
     }
+
+def family_member_data(c, profiles=None):
+    profiles = profiles if profiles is not None else profile_data(c)
+    members = {}
+    for row in c.execute("SELECT * FROM family_members ORDER BY CASE member_id WHEN 'Dad' THEN 0 WHEN 'Mom' THEN 1 WHEN 'Daughter' THEN 2 ELSE 3 END,display_name"):
+        member_id = row["member_id"]
+        if row["member_type"] == "account":
+            profile = profiles.get(row["account_name"])
+            if not profile:
+                continue
+            members[member_id] = {"memberId": member_id, "displayName": profile["displayName"], "profileType": "account", "role": profile["role"], "hasAccount": True, "avatar": row["avatar"]}
+        else:
+            try:
+                managed_by = json.loads(row["managed_by"] or "[]")
+            except json.JSONDecodeError:
+                managed_by = []
+            members[member_id] = {"memberId": member_id, "displayName": row["display_name"], "profileType": "managed_child", "role": "MANAGED CHILD PROFILE", "hasAccount": False, "managedBy": managed_by, "avatar": row["avatar"]}
+    for member_id, profile in profiles.items():
+        members.setdefault(member_id, {"memberId": member_id, "displayName": profile["displayName"], "profileType": "account", "role": profile["role"], "hasAccount": True, "avatar": ""})
+    return members
+
+def family_member_ids(c):
+    return {row["member_id"] for row in c.execute("SELECT member_id FROM family_members")} | {row["name"] for row in c.execute("SELECT name FROM users")}
+
+def managed_member_ids(c):
+    return {row["member_id"] for row in c.execute("SELECT member_id FROM family_members WHERE member_type='managed_child'")}
 
 def normalize_dance_record(source, actor, existing=None):
     record = dict(existing or {})
@@ -238,6 +274,12 @@ def dance_record_for_viewer(record, viewer):
         result.pop("financials", None)
     return result
 
+def family_activity_for_viewer(record, viewer):
+    result = dict(record)
+    if viewer == "Daughter":
+        result.pop("parentNotes", None)
+    return result
+
 def sync_competition_calendar(c, actor, dance_id, competition):
     if competition.get("danceType") != "competition":
         return
@@ -315,6 +357,10 @@ def adult(name):
     return name in {"Dad", "Mom"}
 
 def visible(record, name):
+    if record.get("space") == "Vault" and not adult(name):
+        return False
+    if record.get("space") == "Me" and record.get("creator") != name:
+        return False
     v = record.get("visibility", "Family")
     return (v == "Family" or v == "Adults" and adult(name)
             or v == "Assigned" and record.get("who") == name
@@ -323,7 +369,7 @@ def visible(record, name):
 def editable(record, name):
     return record.get("creator") == name or adult(name) and record.get("visibility") != "Me"
 
-def task_fields(source, actor, existing=None):
+def task_fields(source, actor, existing=None, member_ids=None, managed_ids=None):
     task = dict(existing or {})
     for key in TASK_FIELDS:
         if key in source:
@@ -346,7 +392,9 @@ def task_fields(source, actor, existing=None):
         raise ValueError("Please enter a task name")
     if not isinstance(task["description"], str) or len(task["description"]) > 4000:
         raise ValueError("Invalid task description")
-    if task["who"] not in {"Dad", "Mom", "Daughter", "Everyone", ""}:
+    member_ids = set(member_ids or ACCOUNT_ROLES) | {"Everyone", ""}
+    managed_ids = set(managed_ids or ())
+    if task["who"] not in member_ids:
         raise ValueError("Invalid assignee")
     if task["visibility"] not in VISIBILITY or task["visibility"] == "Adults" and not adult(actor):
         raise ValueError("Invalid visibility")
@@ -368,6 +416,8 @@ def task_fields(source, actor, existing=None):
         raise ValueError("Invalid chore setting")
     if task["chore"] and (task["category"] != "Home" or task["who"] not in {"Daughter", "Everyone"}):
         task["chore"] = False
+    if task["who"] in managed_ids:
+        task["ack"] = False
     for key, pattern in (("dueDate", "%Y-%m-%d"), ("dueTime", "%H:%M")):
         if not isinstance(task[key], str) or len(task[key]) > 32:
             raise ValueError("Invalid task due date or time")
@@ -376,7 +426,7 @@ def task_fields(source, actor, existing=None):
                 dt.datetime.strptime(task[key], pattern)
             except ValueError as error:
                 raise ValueError("Invalid task due date or time") from error
-    task["ack"] = task["priority"] == "Urgent" or task["ack"]
+    task["ack"] = False if task["who"] in managed_ids else task["priority"] == "Urgent" or task["ack"]
     return task
 
 def qualifies_as_chore(task):
@@ -389,7 +439,56 @@ def reminder_offsets(source):
         raise ValueError("Invalid reminder settings")
     return sorted(set(offsets))
 
-def event_fields(source, actor, existing=None):
+def note_fields(source, actor, existing=None):
+    note = dict(existing or {})
+    allowed = ("title", "text", "space", "category", "notes", "details", "date", "reminderDate", "reminderOffsets", "visibility", "who")
+    for key in allowed:
+        if key in source:
+            note[key] = source[key]
+    space = note.get("space")
+    if space not in {None, "Vault", "Me"}:
+        raise ValueError("Choose Adult Vault or Me Only")
+    if space == "Vault":
+        if not adult(actor):
+            raise PermissionError("Adult Vault is only available to parents")
+        if note.get("category", "Other") not in VAULT_CATEGORIES:
+            raise ValueError("Choose a valid Adult Vault category")
+        note["visibility"] = "Adults"
+        note["who"] = "Everyone"
+    elif space == "Me":
+        if existing and existing.get("creator") != actor:
+            raise PermissionError("Me Only records can only be changed by their creator")
+        if note.get("category", "Other") not in ME_CATEGORIES:
+            raise ValueError("Choose a valid Me Only category")
+        note["visibility"] = "Me"
+        note["who"] = actor
+    elif note.get("visibility", "Family") not in VISIBILITY:
+        raise ValueError("Invalid note visibility")
+
+    if space:
+        title = note.get("title", "")
+        if not isinstance(title, str) or not title.strip() or len(title) > 4000:
+            raise ValueError("Please enter a note title")
+        note["title"] = title.strip()
+    for field in ("text", "notes", "details"):
+        value = note.get(field, "")
+        if not isinstance(value, str) or len(value) > 4000:
+            raise ValueError("Note details must be at most 4000 characters")
+    category = note.get("category", "Other")
+    if not isinstance(category, str) or len(category) > 100:
+        raise ValueError("Invalid note category")
+    note["category"] = category
+    for field in ("date", "reminderDate"):
+        value = note.get(field, "")
+        if value:
+            try:
+                dt.date.fromisoformat(value)
+            except (ValueError, TypeError) as error:
+                raise ValueError("Choose a valid note date") from error
+    note["reminderOffsets"] = reminder_offsets(note) if note.get("reminderDate") else []
+    return note
+
+def event_fields(source, actor, existing=None, member_ids=None):
     event = dict(existing or {})
     allowed = ("title", "description", "category", "date", "startTime", "endTime", "allDay", "location", "who", "people", "visibility", "repeat", "customIntervalDays", "reminderOffsets")
     for key in allowed:
@@ -408,7 +507,8 @@ def event_fields(source, actor, existing=None):
     event.setdefault("allDay", not bool(event["startTime"]))
     event.setdefault("location", "")
     event.setdefault("who", "Everyone")
-    event.setdefault("people", [event["who"]] if event["who"] in ACCOUNT_ROLES else [])
+    member_ids = set(member_ids or ACCOUNT_ROLES)
+    event.setdefault("people", [event["who"]] if event["who"] in member_ids else [])
     event.setdefault("visibility", "Family")
     event.setdefault("repeat", "One Time")
     event.setdefault("customIntervalDays", 1)
@@ -437,11 +537,11 @@ def event_fields(source, actor, existing=None):
         raise ValueError("Invalid event category")
     if event["visibility"] not in VISIBILITY or event["visibility"] == "Adults" and not adult(actor):
         raise ValueError("Invalid event visibility")
-    if event["who"] not in {"Dad", "Mom", "Daughter", "Everyone", ""}:
+    if event["who"] not in member_ids | {"Everyone", ""}:
         raise ValueError("Invalid involved family member")
     if event["visibility"] == "Assigned" and event["who"] not in ACCOUNT_ROLES:
         raise ValueError("Assigned events need a family member")
-    if not isinstance(event["people"], list) or any(person not in ACCOUNT_ROLES for person in event["people"]):
+    if not isinstance(event["people"], list) or any(person not in member_ids for person in event["people"]):
         raise ValueError("Invalid event participants")
     if event["repeat"] not in TASK_REPEATS:
         raise ValueError("Invalid event recurrence")
@@ -450,6 +550,78 @@ def event_fields(source, actor, existing=None):
     if event["repeat"] != "One Time" and not 1 <= event["customIntervalDays"] <= 366:
         raise ValueError("Custom recurrence interval must be between 1 and 366 days")
     return event
+
+def normalize_family_activity(c, source, actor, existing=None):
+    if not adult(actor):
+        raise PermissionError("Only parents can manage a managed child's activities")
+    record = dict(existing or {})
+    for field in ACTIVITY_FIELDS:
+        if field in source:
+            record[field] = source[field]
+    member_id = record.get("memberId")
+    member = c.execute("SELECT member_id,member_type FROM family_members WHERE member_id=?", (member_id,)).fetchone()
+    if not member or member["member_type"] != "managed_child":
+        raise ValueError("Choose a managed child profile")
+    for field in ("activityName", "activityType"):
+        value = record.get(field, "")
+        if not isinstance(value, str) or not value.strip() or len(value) > 300:
+            raise ValueError("Enter an activity or sport name")
+        record[field] = value.strip()
+    if record.get("eventType", "Practice") not in {"Practice", "Game / Event", "School Activity", "Camp", "Other"}:
+        raise ValueError("Choose an activity event type")
+    record.setdefault("eventType", "Practice")
+    for field in ("organization", "season", "location", "equipmentNotes", "parentNotes"):
+        value = record.get(field, "")
+        if not isinstance(value, str) or len(value) > 2000:
+            raise ValueError("Activity details must be at most 2000 characters")
+        record[field] = value
+    try:
+        dt.date.fromisoformat(record["date"])
+    except (ValueError, TypeError, KeyError) as error:
+        raise ValueError("Choose a valid activity date") from error
+    for field in ("startTime", "endTime"):
+        value = record.get(field, "")
+        if value:
+            try:
+                dt.datetime.strptime(value, "%H:%M")
+            except (ValueError, TypeError) as error:
+                raise ValueError("Choose a valid activity time") from error
+    if record.get("startTime") and record.get("endTime") and record["endTime"] <= record["startTime"]:
+        raise ValueError("Activity end time must be after its start time")
+    record["reminderOffsets"] = reminder_offsets(record) if record.get("reminderOffsets") else []
+    record.update(visibility="Family", who="Everyone")
+    return record
+
+def sync_family_activity_calendar(c, actor, activity_id, activity):
+    rows = c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0").fetchall()
+    matches = [(row["id"], json.loads(row["body"])) for row in rows if json.loads(row["body"]).get("sourceActivityId") == activity_id]
+    member = c.execute("SELECT display_name FROM family_members WHERE member_id=?", (activity["memberId"],)).fetchone()
+    member_name = member["display_name"] if member else activity["memberId"]
+    activity_label = activity["activityName"]
+    created_at = activity.get("createdAt", stamp())
+    event = {
+        "title": f"{member_name} · {activity_label}",
+        "description": "\n".join(value for value in (activity.get("organization", ""), activity.get("season", ""), activity.get("equipmentNotes", "")) if value),
+        "date": activity["date"], "startTime": activity.get("startTime", ""), "endTime": activity.get("endTime", ""),
+        "allDay": not bool(activity.get("startTime")), "location": activity.get("location", ""),
+        "who": "Everyone", "people": ["Dad", "Mom", "Daughter", activity["memberId"]], "visibility": "Family",
+        "category": "School" if activity.get("eventType") == "School Activity" else "Family",
+        "repeat": "One Time", "reminderOffsets": activity.get("reminderOffsets", []),
+        "sourceActivityId": activity_id, "creator": actor, "by": actor,
+        "createdAt": created_at, "updatedAt": stamp(),
+    }
+    event = event_fields(event, actor, member_ids=family_member_ids(c))
+    event.update(sourceActivityId=activity_id, sourceActivityKey="schedule", creator=actor, by=actor,
+                 createdAt=matches[0][1].get("createdAt", created_at) if matches else created_at, updatedAt=stamp())
+    if matches:
+        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(event), matches[0][0]))
+        for duplicate_id, _ in matches[1:]:
+            c.execute("UPDATE records SET deleted=1 WHERE id=?", (duplicate_id,))
+        c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?",
+                  (event["updatedAt"], matches[0][0]))
+    else:
+        cursor = c.execute("INSERT INTO records(kind,body) VALUES('events',?)", (json.dumps(event),))
+        audit_record(c, actor, cursor.lastrowid, "create", {**event, "id": cursor.lastrowid})
 
 def family_timezone():
     try:
@@ -525,14 +697,14 @@ def ensure_recurrence_occurrences(c, now=None):
                          {**occurrence, "id": task_id}, {"seriesId": series["series_id"], "sequence": sequence})
 
 def item_reminder_times(record, kind, zone):
-    date_value = record.get("date") if kind == "events" else record.get("dueDate")
+    date_value = record.get("date") if kind == "events" else record.get("reminderDate") if kind == "notes" else record.get("dueDate")
     if not date_value:
         return None, None
     try:
         day = dt.date.fromisoformat(date_value[:10])
     except (ValueError, TypeError):
         return None, None
-    time_value = record.get("startTime", "") if kind == "events" else record.get("dueTime", "")
+    time_value = record.get("startTime", "") if kind == "events" else record.get("dueTime", "") if kind == "tasks" else ""
     reminder_time = dt.time(9, 0) if not time_value or record.get("allDay") else dt.time.fromisoformat(time_value)
     due_time = dt.time(23, 59) if kind == "tasks" and not time_value else reminder_time
     reminder_at = dt.datetime.combine(day, reminder_time, zone)
@@ -551,7 +723,7 @@ def reminder_recipients(record, profiles):
 def generate_reminders(c, profiles, now=None):
     zone = family_timezone()
     current = now or dt.datetime.now(zone)
-    for row in c.execute("SELECT id,kind,body FROM records WHERE deleted=0 AND kind IN ('tasks','events')").fetchall():
+    for row in c.execute("SELECT id,kind,body FROM records WHERE deleted=0 AND kind IN ('tasks','events','notes')").fetchall():
         record = json.loads(row["body"])
         kind = row["kind"]
         reminder_at, due_at = item_reminder_times(record, kind, zone)
@@ -570,8 +742,11 @@ def generate_reminders(c, profiles, now=None):
                     continue
                 trigger = reminder_at - dt.timedelta(minutes=offset)
                 if trigger <= current:
+                    reminder_type = "event_upcoming" if kind == "events" else "task_due"
+                    if kind == "notes":
+                        reminder_type = "vault_reminder" if record.get("space") == "Vault" or record.get("visibility") == "Adults" else "me_reminder" if record.get("space") == "Me" or record.get("visibility") == "Me" else "note_reminder"
                     c.execute("INSERT OR IGNORE INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
-                              (account, kind, row["id"], f"offset:{offset}:{reminder_at.isoformat()}:{record.get('updatedAt','')}", "event_upcoming" if kind == "events" else "task_due", trigger.isoformat(), stamp()))
+                              (account, kind, row["id"], f"offset:{offset}:{reminder_at.isoformat()}:{record.get('updatedAt','')}", reminder_type, trigger.isoformat(), stamp()))
             if kind == "tasks" and record.get("status") == "open":
                 acked = set(record.get("acked", []))
                 assignee = record.get("who")
@@ -604,7 +779,9 @@ def audit_notification_types(kind, action, record, actor, account):
         return ["board_update"]
     if kind == "dance" and action in {"create", "edit", "check", "checklist_item", "competition_unlinked", "deadline_completed"}:
         return ["dance_update"]
-    if kind == "events" and action in {"create", "edit"} and not record.get("sourceDanceId"):
+    if kind == "activities" and action in {"create", "edit"}:
+        return ["calendar_update"]
+    if kind == "events" and action in {"create", "edit"} and not record.get("sourceDanceId") and not record.get("sourceActivityId"):
         return ["calendar_update"]
     if kind == "lists" and action in {"create", "check"}:
         return ["list_update"]
@@ -651,6 +828,7 @@ def reminder_category(reminder_type):
         "task_assigned": "tasks", "task_acknowledgement": "tasks", "task_update": "tasks",
         "request_update": "requests", "board_update": "board", "dance_update": "dance",
         "calendar_update": "calendar", "list_update": "lists", "weekly_recap": "recap",
+        "vault_reminder": "vault", "me_reminder": "private",
     }.get(reminder_type, "reminders")
 
 def reminder_state(c, account, state):
@@ -681,7 +859,7 @@ def reminder_state(c, account, state):
             "title": source.get("title", source.get("text", "")), "description": source.get("description", ""),
             "who": source.get("who", ""), "priority": source.get("priority", ""),
             "category": source.get("category", ""), "visibility": source.get("visibility", "Family"),
-            "date": source.get("date", source.get("dueDate", "")),
+            "date": source.get("reminderDate", source.get("date", source.get("dueDate", ""))),
             "time": source.get("startTime", source.get("dueTime", "")),
         })
     return result
@@ -734,7 +912,7 @@ def dance_attention_items(account, state):
     return sorted(attention.values(), key=lambda item: (item["target"], item["title"].casefold()))
 
 def notification_badge_counts(account, state):
-    sources = {"tasks": set(), "requests": set(), "dance": set(), "board": set(), "calendar": set(), "lists": set(), "recap": set(), "reminders": set()}
+    sources = {"tasks": set(), "requests": set(), "dance": set(), "board": set(), "calendar": set(), "lists": set(), "recap": set(), "vault": set(), "private": set(), "reminders": set()}
     task_by_id = {task["id"]: task for task in state["tasks"]}
     for item in state["reminders"]:
         if item["dismissed"]:
@@ -778,7 +956,7 @@ def notification_badge_counts(account, state):
         sources["recognition"] = set()
     return {name: min(len(items), 10) for name, items in sources.items()}
 
-def edit_record_scope(c, actor, record_id, kind, current, changes, scope):
+def edit_record_scope(c, actor, record_id, kind, current, changes, scope, member_ids=None, managed_ids=None):
     if kind not in {"tasks", "events"} or not adult(actor) or not editable(current, actor):
         raise PermissionError("You cannot edit this item")
     series_id = current.get("seriesId")
@@ -793,7 +971,7 @@ def edit_record_scope(c, actor, record_id, kind, current, changes, scope):
     allowed = set(TASK_FIELDS if kind == "tasks" else ("title", "description", "category", "date", "startTime", "endTime", "allDay", "location", "who", "people", "visibility", "repeat", "customIntervalDays", "reminderOffsets"))
     if not isinstance(changes, dict) or set(changes) - allowed:
         raise ValueError("Invalid item changes")
-    validate = task_fields if kind == "tasks" else event_fields
+    validate = (lambda source, editor, existing=None: task_fields(source, editor, existing, member_ids, managed_ids)) if kind == "tasks" else (lambda source, editor, existing=None: event_fields(source, editor, existing, member_ids))
     if scope == "this":
         updated = validate(changes, actor, current)
         details = {"before": {}, "after": {}}
@@ -922,6 +1100,10 @@ def activity_entry(row, snapshot, profiles, viewer, record_kind=""):
             if isinstance(revision, dict):
                 revision.pop("fees", None)
                 revision.pop("financials", None)
+    if viewer == "Daughter" and record_kind == "activities":
+        for revision in (details.get("before"), details.get("after")):
+            if isinstance(revision, dict):
+                revision.pop("parentNotes", None)
     actor = profiles.get(row["actor"], {}).get("displayName", row["actor"])
     title = snapshot.get("title") or snapshot.get("text") or "an item"
     action = row["action"]
@@ -941,8 +1123,42 @@ def activity_entry(row, snapshot, profiles, viewer, record_kind=""):
     elif record_kind == "recognitions" and action == "create":
         recipient = profiles.get(snapshot.get("who"), {}).get("displayName", "a family member")
         summary = f'🌟 {actor} recognized {recipient}: {snapshot.get("recognitionType", "Nice Work")}'
+    elif record_kind == "notes" and action == "create":
+        if snapshot.get("space") == "Vault" or snapshot.get("visibility") == "Adults":
+            summary = f"🔒 {actor} added an Adult Vault entry"
+        elif snapshot.get("space") == "Me" or snapshot.get("visibility") == "Me":
+            summary = f"🔐 {actor} added a Me Only entry"
+        else:
+            summary = f"📝 {actor} added a family note"
     elif record_kind == "dance" and action == "deadline_completed":
         summary = f'✅ {actor} completed a competition deadline for "{title}"'
+    elif record_kind == "activities" and action == "create":
+        member = profiles.get(snapshot.get("memberId"), {}).get("displayName", snapshot.get("memberId", "a family member"))
+        summary = f"🗓️ {actor} added {member}'s {snapshot.get('activityType', 'activity')} to the family calendar"
+    elif record_kind == "activities" and action == "edit":
+        member = profiles.get(snapshot.get("memberId"), {}).get("displayName", snapshot.get("memberId", "a family member"))
+        summary = f"📝 {actor} updated {member}'s {snapshot.get('activityType', 'activity')} schedule"
+    elif record_kind == "activities" and action == "delete":
+        member = profiles.get(snapshot.get("memberId"), {}).get("displayName", snapshot.get("memberId", "a family member"))
+        summary = f"🗑️ {actor} removed {member}'s {snapshot.get('activityType', 'activity')} schedule"
+    elif record_kind == "dance" and action == "competition_unlinked":
+        summary = f'🔗 {actor} updated dance links for "{title}"'
+    elif action == "checklist_item":
+        summary = f'✅ {actor} updated the checklist for "{title}"'
+    elif action == "check":
+        summary = f'✅ {actor} updated "{title}"'
+    elif action == "comment":
+        summary = f'💬 {actor} commented on "{title}"'
+    elif action == "delete_comment":
+        summary = f'🗑️ {actor} removed a comment from "{title}"'
+    elif action == "pin":
+        summary = f'📌 {actor} updated a family post'
+    elif action == "react":
+        summary = f'💛 {actor} reacted to a family post'
+    elif action == "decision":
+        summary = f'💬 {actor} updated a family request'
+    elif action in {"recurrence_occurrence_created", "recurrence_occurrence_deleted"}:
+        summary = f'🔁 {actor} updated the schedule for "{title}"'
     elif action == "create":
         summary = f"📝 {actor} created {item_type} \"{title}\""
     elif action == "recurring_series_created":
@@ -981,12 +1197,16 @@ def activity_entry(row, snapshot, profiles, viewer, record_kind=""):
     elif action == "delete":
         summary = f"🗑️ {actor} deleted \"{title}\""
     else:
-        summary = f"{actor} {action} \"{title}\""
-    return {
+        item_names = {"tasks": "a family task", "events": "a family event", "posts": "a family post", "requests": "a family request", "lists": "a shared list", "notes": "a private note", "dance": "a dance item", "activities": "a family activity"}
+        summary = f'{actor} updated {item_names.get(record_kind, "a family item")}' + (f' "{title}"' if record_kind not in {"notes", "activities"} else "")
+    result = {
         "id": row["id"], "recordId": row["record_id"], "actor": row["actor"],
         "actorName": actor, "action": action, "title": title, "summary": summary,
         "createdAt": row["created"], "details": details,
     }
+    if viewer == "Daughter":
+        return {"actorName": actor, "summary": summary, "createdAt": row["created"]}
+    return result
 
 def chore_completion_metrics(c):
     completions = []
@@ -1069,6 +1289,8 @@ class Handler(BaseHTTPRequestHandler):
                     if visible(record, name):
                         if row["kind"] == "dance":
                             record = dance_record_for_viewer(record, name)
+                        if row["kind"] == "activities":
+                            record = family_activity_for_viewer(record, name)
                         if row["kind"] == "tasks":
                             record["chore"] = qualifies_as_chore(record)
                         if row["kind"] == "recognitions" and name == "Daughter":
@@ -1091,6 +1313,7 @@ class Handler(BaseHTTPRequestHandler):
                         break
                 state["activity"] = activity
                 state.update(viewer=name, profiles=profiles, **chore_completion_metrics(c))
+                state["familyMembers"] = family_member_data(c, profiles)
                 state["timezone"] = HUB_TIMEZONE
                 generate_reminders(c, profiles)
                 generate_notification_reminders(c, profiles)
@@ -1167,8 +1390,8 @@ class Handler(BaseHTTPRequestHandler):
                             "requests": ("request_update",), "board": ("board_update",),
                             "dance": ("dance_update", "dance_upcoming"),
                             "calendar": ("calendar_update", "event_upcoming"), "lists": ("list_update",),
-                            "recap": ("weekly_recap",),
-                            "reminders": ("task_due", "priority", "overdue", "urgent_ack", "task_assigned", "task_acknowledgement", "task_update", "request_update", "board_update", "dance_update", "dance_upcoming", "calendar_update", "event_upcoming", "list_update", "weekly_recap"),
+                            "recap": ("weekly_recap",), "vault": ("vault_reminder",), "private": ("me_reminder",),
+                            "reminders": ("task_due", "priority", "overdue", "urgent_ack", "task_assigned", "task_acknowledgement", "task_update", "request_update", "board_update", "dance_update", "dance_upcoming", "calendar_update", "event_upcoming", "list_update", "weekly_recap", "vault_reminder", "me_reminder", "note_reminder"),
                         }
                         types = category_types.get(category)
                         if not types:
@@ -1248,7 +1471,9 @@ class Handler(BaseHTTPRequestHandler):
                     r = payload.get("record", {})
                     if not isinstance(r, dict):
                         raise ValueError("Invalid item")
-                    r = {key: r[key] for key in ("title", "text", "description", "date", "startDate", "endDate", "neededBy", "startTime", "endTime", "allDay", "location", "people", "customIntervalDays", "reminderOffsets", "dueDate", "dueTime", "who", "priority", "visibility", "type", "category", "repeat", "ack", "chore", "status", "reply", "replyBy", "time", "important", "pinned", "ackRequired", "comments", "acknowledgedBy", "responses", "history", "recognitionType", "message", "sourceTaskId") + (DANCE_FIELDS if kind == "dance" else ()) if key in r}
+                    r = {key: r[key] for key in ("title", "text", "description", "date", "startDate", "endDate", "neededBy", "startTime", "endTime", "allDay", "location", "people", "customIntervalDays", "reminderOffsets", "reminderDate", "dueDate", "dueTime", "who", "priority", "visibility", "type", "category", "repeat", "ack", "chore", "status", "reply", "replyBy", "time", "important", "pinned", "ackRequired", "comments", "acknowledgedBy", "responses", "history", "recognitionType", "message", "sourceTaskId", "space", "notes", "details") + (DANCE_FIELDS if kind == "dance" else ()) + (ACTIVITY_FIELDS if kind == "activities" else ()) if key in r}
+                    if kind == "activities":
+                        r.setdefault("title", r.get("activityName", ""))
                     for key in ("title", "text", "description", "date", "startTime", "endTime", "location", "dueDate", "dueTime", "type", "category", "repeat", "status", "reply", "replyBy", "time"):
                         if key in r and (not isinstance(r[key], str) or len(r[key]) > 4000):
                             raise ValueError("Invalid text")
@@ -1264,15 +1489,15 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError("Invalid visibility")
                     if kind == "events" and not adult(name):
                         return self.respond(403, {"error": "Only parents can create family events"})
-                    if r.get("who", "Everyone") not in {"Dad", "Mom", "Daughter", "Everyone", ""}:
+                    if r.get("who", "Everyone") not in family_member_ids(c) | {"Everyone", ""}:
                         raise ValueError("Invalid assignee")
                     if r["visibility"] == "Assigned" and r.get("who") not in {"Dad", "Mom", "Daughter"}:
                         raise ValueError("Choose one assigned person")
                     if kind == "tasks":
-                        r.update(task_fields(r, name))
+                        r.update(task_fields(r, name, member_ids=family_member_ids(c), managed_ids=managed_member_ids(c)))
                         r.update(status="open", acked=[], acknowledgements=[], reason="", completionHistory=[], notCompletedHistory=[])
                     if kind == "events":
-                        r.update(event_fields(r, name))
+                        r.update(event_fields(r, name, member_ids=family_member_ids(c)))
                         if r["repeat"] != "One Time":
                             r["seriesKind"] = "events"
                     if kind == "dance" and r.get("danceType"):
@@ -1280,6 +1505,12 @@ class Handler(BaseHTTPRequestHandler):
                             return self.respond(403, {"error": "Only parents can manage dance details"})
                         r.update(normalize_dance_record(r, name))
                         validate_dance_associations(c, r, name)
+                    if kind == "activities":
+                        if not adult(name):
+                            return self.respond(403, {"error": "Only parents can manage child activities"})
+                        r.update(normalize_family_activity(c, r, name))
+                    if kind == "notes":
+                        r.update(note_fields(r, name))
                     if kind == "requests":
                         r.setdefault("type", "Other")
                         r.setdefault("title", r.get("text", "").strip() or "Request")
@@ -1342,6 +1573,8 @@ class Handler(BaseHTTPRequestHandler):
                     rid = cursor.lastrowid
                     if kind == "dance" and r.get("danceType") == "competition":
                         sync_competition_calendar(c, name, rid, r)
+                    if kind == "activities":
+                        sync_family_activity_calendar(c, name, rid, r)
                     if kind in {"tasks", "events"} and r.get("repeat") != "One Time":
                         start_date = r.get("dueDate") if kind == "tasks" else r.get("date")
                         if not start_date:
@@ -1417,6 +1650,11 @@ class Handler(BaseHTTPRequestHandler):
                                         linked_record.update(updatedAt=deleted_at, updatedBy=name)
                                         c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(linked_record), linked_row["id"]))
                                         audit_record(c, name, linked_row["id"], "competition_unlinked", {**linked_record, "id": linked_row["id"]}, {"before": before, "competitionId": target_id})
+                            if kind == "activities":
+                                for linked_event in c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0").fetchall():
+                                    if json.loads(linked_event["body"]).get("sourceActivityId") == target_id:
+                                        c.execute("UPDATE records SET deleted=1 WHERE id=?", (linked_event["id"],))
+                                        c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (deleted_at, linked_event["id"]))
                         if series and scope == "this":
                             audit_record(c, name, rid, "recurrence_occurrence_deleted", {**r, "id": rid}, {"scope": scope})
                         c.commit()
@@ -1440,6 +1678,41 @@ class Handler(BaseHTTPRequestHandler):
                             r = updated
                             if r.get("danceType") == "competition":
                                 sync_competition_calendar(c, name, rid, r)
+                        elif kind == "notes":
+                            if not editable(r, name):
+                                return self.respond(403, {"error": "You cannot edit this note"})
+                            changes = payload.get("record")
+                            allowed = {"title", "text", "space", "category", "notes", "details", "date", "reminderDate", "reminderOffsets", "visibility", "who"}
+                            if not isinstance(changes, dict) or set(changes) - allowed:
+                                raise ValueError("Invalid note changes")
+                            updated = note_fields(changes, name, r)
+                            event_details = {"before": {}, "after": {}}
+                            for field in changes:
+                                if r.get(field) != updated.get(field):
+                                    event_details["before"][field] = r.get(field)
+                                    event_details["after"][field] = updated.get(field)
+                            updated.update(updatedAt=stamp(), updatedBy=name)
+                            if {"date", "reminderDate", "reminderOffsets"} & set(event_details["after"]):
+                                c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='notes' AND source_id=?",
+                                          (updated["updatedAt"], rid))
+                            r = updated
+                            action = "edit"
+                        elif kind == "activities":
+                            if not adult(name):
+                                return self.respond(403, {"error": "Only parents can manage child activities"})
+                            changes = payload.get("record")
+                            if not isinstance(changes, dict) or set(changes) - set(ACTIVITY_FIELDS):
+                                raise ValueError("Invalid activity changes")
+                            updated = normalize_family_activity(c, changes, name, r)
+                            event_details = {"before": {}, "after": {}}
+                            for field in changes:
+                                if r.get(field) != updated.get(field):
+                                    event_details["before"][field] = r.get(field)
+                                    event_details["after"][field] = updated.get(field)
+                            updated.update(updatedAt=stamp(), updatedBy=name)
+                            r = updated
+                            action = "edit"
+                            sync_family_activity_calendar(c, name, rid, r)
                         else:
                             if kind not in {"tasks", "events"} or not adult(name):
                                 return self.respond(403, {"error": "Only parents can edit tasks and events"})
@@ -1447,7 +1720,8 @@ class Handler(BaseHTTPRequestHandler):
                                 return self.respond(403, {"error": "You cannot edit this item"})
                             changes = payload.get("record")
                             scope = payload.get("scope", "this")
-                            r, extra_audit_events = edit_record_scope(c, name, rid, kind, r, changes, scope)
+                            r, extra_audit_events = edit_record_scope(c, name, rid, kind, r, changes, scope,
+                                                                     family_member_ids(c), managed_member_ids(c))
                             event_details = next((details for target_id, event_action, details in extra_audit_events if target_id == rid and event_action == "edit"), {})
                             if r.get("seriesId"):
                                 action = "recurring_series_changed" if scope in {"future", "series"} else "recurring_occurrence_edited"
@@ -1674,6 +1948,8 @@ class Handler(BaseHTTPRequestHandler):
                     audit_record(c, name, rid, "due_date", snapshot, event_details)
                 c.commit()
                 return self.respond(200, {"ok": True})
+        except PermissionError as error:
+            self.respond(403, {"error": str(error)})
         except (ValueError, TypeError, KeyError, OverflowError) as error:
             self.respond(400, {"error": str(error)})
 
