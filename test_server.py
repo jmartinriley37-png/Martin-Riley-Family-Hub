@@ -33,6 +33,8 @@ class FamilyPrivacyTests(unittest.TestCase):
         with server.connection() as c:
             c.execute("DELETE FROM audit")
             c.execute("DELETE FROM reminders")
+            c.execute("DELETE FROM recognition_receipts")
+            c.execute("UPDATE notification_settings SET value='0' WHERE name='audit_notification_last_id'")
             c.execute("DELETE FROM recurrence_occurrences")
             c.execute("DELETE FROM recurrence_series")
             c.execute("DELETE FROM records")
@@ -99,6 +101,13 @@ class FamilyPrivacyTests(unittest.TestCase):
                     self.assertEqual(c.execute('SELECT COUNT(*) FROM audit').fetchone()[0], 1)
                     self.assertEqual(c.execute('SELECT snapshot FROM audit').fetchone()['snapshot'], '{}')
                     self.assertIn('deleted', {row['name'] for row in c.execute('PRAGMA table_info(records)')})
+                    self.assertIn('notification_settings', {row['name'] for row in c.execute("SELECT name FROM sqlite_master WHERE type='table'")})
+                    self.assertEqual(c.execute("SELECT COUNT(*) FROM notification_settings WHERE name='audit_notifications_started_at'").fetchone()[0], 1)
+                    self.assertEqual(c.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()[0], '1')
+                server.initialize()
+                with server.connection() as c:
+                    self.assertEqual(c.execute("SELECT COUNT(*) FROM notification_settings WHERE name='audit_notifications_started_at'").fetchone()[0], 1)
+                    self.assertEqual(c.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()[0], '1')
             finally:
                 server.DB = previous_db
 
@@ -212,6 +221,87 @@ class FamilyPrivacyTests(unittest.TestCase):
         dismissed = next(r for r in self.call(daughter, 'state')[1]['reminders'] if r['id'] == reminder['id'])
         self.assertTrue(dismissed['dismissed'])
 
+    def test_badge_counts_are_per_user_filtered_deduplicated_and_actionable(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        task_date = (server.local_today() + __import__('datetime').timedelta(days=4)).isoformat()
+        self.create(dad, 'tasks', title='Arielle urgent chore', who='Daughter', priority='Normal', ack=True,
+                    visibility='Family', category='Home', dueDate=task_date, reminderOffsets=[])
+        self.create(dad, 'tasks', title='Dad private badge task', who='Dad', priority='Urgent', ack=True,
+                    visibility='Me', category='Bills', dueDate=task_date, reminderOffsets=[])
+        self.create(mom, 'tasks', title='Mom private badge task', who='Mom', priority='Urgent', ack=True,
+                    visibility='Me', category='Bills', dueDate=task_date, reminderOffsets=[])
+        self.create(daughter, 'requests', title='Ride request', text='Can I get a ride?', type='Ride')
+        request = next(item for item in self.call(dad, 'state')[1]['requests'] if item['title'] == 'Ride request')
+        self.assertGreaterEqual(self.call(dad, 'state')[1]['badgeCounts']['requests'], 1)
+        self.assertGreaterEqual(self.call(mom, 'state')[1]['badgeCounts']['requests'], 1)
+        dad_before_reply = self.call(dad, 'state')[1]
+        dad_request_notice = next(item for item in dad_before_reply['reminders'] if item['type'] == 'request_update' and item['sourceId'] == request['id'])
+        self.assertEqual(self.call(dad, 'reminders/action', {'id': dad_request_notice['id'], 'action': 'read'})[0], 200)
+        self.assertGreaterEqual(self.call(dad, 'state')[1]['badgeCounts']['requests'], 1)
+        self.assertEqual(self.call(dad, 'action', {'action': 'reply', 'id': request['id'], 'reply': 'Which time?'})[0], 200)
+        self.assertGreaterEqual(self.call(daughter, 'state')[1]['badgeCounts']['requests'], 1)
+
+        self.create(dad, 'posts', text='Please acknowledge recital time', important=True, ackRequired=True)
+        future_deadline = (server.local_today() + __import__('datetime').timedelta(days=20)).isoformat()
+        self.create(dad, 'dance', title='Badge Test Competition', danceType='competition', startDate=task_date,
+                deadlines=[{'id': 'payment', 'title': 'Dance payment due', 'date': future_deadline}])
+        self.create(dad, 'events', title='Visible parent event', date=task_date, category='Family', allDay=True)
+        self.create(mom, 'lists', text='Packing socks', visibility='Family')
+        self.create(dad, 'recognitions', recognitionType='Nice Work', message='Great effort!')
+        daughter_state = self.call(daughter, 'state')[1]
+        self.assertGreaterEqual(daughter_state['badgeCounts']['tasks'], 1)
+        self.assertGreaterEqual(daughter_state['badgeCounts']['board'], 1)
+        self.assertGreaterEqual(daughter_state['badgeCounts']['dance'], 1)
+        self.assertEqual(daughter_state['badgeCounts']['dance'], 1)
+        competition_attention = next(item for item in daughter_state['danceAttention'] if item['title'] == 'Badge Test Competition')
+        self.assertTrue(any('Performance schedule pending' in reason for reason in competition_attention['reasons']))
+        self.assertTrue(any('Dance payment due' in reason for reason in competition_attention['reasons']))
+        self.assertGreaterEqual(daughter_state['badgeCounts']['calendar'], 1)
+        self.assertGreaterEqual(daughter_state['badgeCounts']['lists'], 1)
+        self.assertGreaterEqual(daughter_state['badgeCounts']['recognition'], 1)
+        self.assertEqual(daughter_state['badgeCounts']['recap'], 1)
+        daughter_tasks = json.dumps(daughter_state['tasks'])
+        self.assertNotIn('Dad private badge task', daughter_tasks)
+        self.assertNotIn('Mom private badge task', daughter_tasks)
+        self.assertNotIn('Dad private badge task', json.dumps(daughter_state['reminders']))
+        self.assertNotIn('Mom private badge task', json.dumps(daughter_state['reminders']))
+
+        second_daughter_session = self.client('Daughter')
+        self.assertEqual(self.call(second_daughter_session, 'state')[1]['badgeCounts'], daughter_state['badgeCounts'])
+        with server.connection() as db:
+            notification_rows_before = db.execute("SELECT COUNT(*) FROM reminders WHERE account='Daughter' AND reminder_key LIKE 'notice:%'").fetchone()[0]
+            audit_cursor_before = int(db.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()['value'])
+        self.call(second_daughter_session, 'state')
+        with server.connection() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM reminders WHERE account='Daughter' AND reminder_key LIKE 'notice:%'").fetchone()[0], notification_rows_before)
+            self.assertEqual(int(db.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()['value']), audit_cursor_before)
+        request_notice = next(item for item in daughter_state['reminders'] if item['type'] == 'request_update' and item['sourceId'] == request['id'])
+        self.assertEqual(self.call(mom, 'reminders/action', {'id': request_notice['id'], 'action': 'read'})[0], 404)
+        self.assertEqual(self.call(mom, 'reminders/action', {'action': 'read_category', 'category': 'requests'})[0], 200)
+        self.assertGreaterEqual(self.call(daughter, 'state')[1]['badgeCounts']['requests'], 1)
+        self.assertEqual(self.call(second_daughter_session, 'reminders/action', {'action': 'read_category', 'category': 'requests'})[0], 200)
+        self.assertEqual(self.call(daughter, 'state')[1]['badgeCounts']['requests'], 0)
+        self.assertEqual(self.call(dad, 'action', {'action': 'decision', 'id': request['id'], 'status': 'Approved'})[0], 200)
+        self.assertEqual(self.call(dad, 'state')[1]['badgeCounts']['requests'], 0)
+        post = next(item for item in daughter_state['posts'] if item['text'] == 'Please acknowledge recital time')
+        board_notice = next(item for item in daughter_state['reminders'] if item['type'] == 'board_update' and item['sourceId'] == post['id'])
+        self.assertEqual(self.call(daughter, 'reminders/action', {'id': board_notice['id'], 'action': 'read'})[0], 200)
+        self.assertGreaterEqual(self.call(daughter, 'state')[1]['badgeCounts']['board'], 1)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'ack', 'id': post['id']})[0], 200)
+        self.assertEqual(self.call(daughter, 'state')[1]['badgeCounts']['board'], 0)
+        task = next(item for item in daughter_state['tasks'] if item['title'] == 'Arielle urgent chore')
+        task_notices = [item for item in daughter_state['reminders'] if item['sourceKind'] == 'tasks' and item['sourceId'] == task['id'] and item['type'] in {'task_assigned', 'task_acknowledgement'}]
+        self.assertTrue(task_notices)
+        self.assertEqual(self.call(daughter, 'reminders/action', {'action': 'read_category', 'category': 'tasks'})[0], 200)
+        self.assertGreaterEqual(self.call(daughter, 'state')[1]['badgeCounts']['tasks'], 1)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'ack', 'id': task['id']})[0], 200)
+        self.assertEqual(self.call(daughter, 'state')[1]['badgeCounts']['tasks'], 0)
+
+        recap_reminder = next(item for item in daughter_state['reminders'] if item['type'] == 'weekly_recap')
+        self.assertEqual(self.call(daughter, 'reminders/action', {'id': recap_reminder['id'], 'action': 'read'})[0], 200)
+        self.assertEqual(self.call(daughter, 'state')[1]['badgeCounts']['recap'], 0)
+        self.assertGreaterEqual(self.call(dad, 'state')[1]['badgeCounts']['recap'], 1)
+
     def test_visibility_and_history_never_leak(self):
         dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]
         for v, text in [('Family','shared'),('Adults','adult-secret'),('Me','dad-secret'),('Assigned','mom-secret')]:
@@ -235,6 +325,10 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertEqual(self.call(daughter,'action',dict(action='done',id=task['id']))[0],400)
         self.assertEqual(self.call(daughter,'action',dict(action='ack',id=task['id']))[0],200)
         self.assertEqual(self.call(daughter,'action',dict(action='done',id=task['id']))[0],200)
+        daughter_state = self.call(daughter, 'state')[1]
+        self.assertEqual(next(item for item in daughter_state['tasks'] if item['id'] == task['id'])['status'], 'done')
+        self.assertEqual(daughter_state['badgeCounts']['tasks'], 0)
+        self.assertFalse(any(item['type'] == 'urgent_ack' and item['sourceId'] == task['id'] for item in daughter_state['reminders']))
         self.assertEqual(self.call(dad,'state')[1]['tasks'][-1]['status'],'done')
         self.assertEqual(self.call(daughter,'action',dict(action='create',kind='tasks',record={'title':'no'}))[0],403)
 
@@ -464,6 +558,398 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertEqual(self.call(daughter,'state')[1]['requests'][-1]['status'],'Approved')
         self.assertEqual(self.call(daughter,'logout',{})[0],200)
         self.assertEqual(self.call(daughter,'state')[0],401)
+
+    def test_ask_parents_request_flow_and_calendar_conversion(self):
+        daughter, mom, dad = [self.client(n) for n in ('Daughter', 'Mom', 'Dad')]
+        self.create(daughter, 'requests', title='Friends house', text='Can I go to my friend’s house?',
+                    type='Permission', date='2026-10-12', time='18:30',
+                    description='Her parent will bring me home after dinner.')
+        request = next(r for r in self.call(dad, 'state')[1]['requests'] if r['title'] == 'Friends house')
+        self.assertEqual(request['status'], 'Pending')
+        self.assertEqual((request['type'], request['date'], request['time'], request['description']),
+                         ('Permission', '2026-10-12', '18:30', 'Her parent will bring me home after dinner.'))
+        for parent in (dad, mom):
+            parent_request = next(r for r in self.call(parent, 'state')[1]['requests'] if r['id'] == request['id'])
+            self.assertEqual(parent_request['description'], request['description'])
+        with server.connection() as db:
+            stored_request = json.loads(db.execute('SELECT body FROM records WHERE id=?', (request['id'],)).fetchone()['body'])
+        self.assertEqual(stored_request['date'], '2026-10-12')
+        self.assertEqual(stored_request['time'], '18:30')
+        self.assertEqual(stored_request['description'], 'Her parent will bring me home after dinner.')
+        self.assertFalse(any(event.get('sourceRequestId') == request['id'] for event in self.call(daughter, 'state')[1]['events']))
+        parent_activity = self.call(dad, 'state')[1]['activity']
+        daughter_activity = self.call(daughter, 'state')[1]['activity']
+        self.assertIn('🙋 Arielle sent a Permission request "Friends house"', [entry['summary'] for entry in parent_activity])
+        self.assertIn('🙋 Arielle sent a Permission request "Friends house"', [entry['summary'] for entry in daughter_activity])
+        self.assertNotIn('created task "Friends house"', [entry['summary'] for entry in parent_activity])
+        self.assertEqual(self.call(daughter, 'action', {'action': 'decision', 'id': request['id'], 'status': 'Approved', 'reply': 'Yes, after practice', 'addToCalendar': True})[0], 403)
+        self.assertEqual(self.call(dad, 'action', {'action': 'reply', 'id': request['id'], 'reply': 'Which friend’s house?'})[0], 200)
+        after_question = next(r for r in self.call(daughter, 'state')[1]['requests'] if r['id'] == request['id'])
+        self.assertEqual(after_question['status'], 'Pending')
+        self.assertEqual(after_question['responses'][-1]['by'], 'Dad')
+        self.assertEqual(after_question['responses'][-1]['reply'], 'Which friend’s house?')
+        self.assertTrue(after_question['responses'][-1]['createdAt'])
+        self.assertEqual(next(r for r in self.call(mom, 'state')[1]['requests'] if r['id'] == request['id'])['responses'][-1]['reply'], 'Which friend’s house?')
+        self.assertIn('💬 Jermaine replied to Arielle’s request "Friends house"', [entry['summary'] for entry in self.call(daughter, 'state')[1]['activity']])
+        self.assertEqual(self.call(daughter, 'action', {'action': 'reply', 'id': request['id'], 'reply': 'Maya’s house'})[0], 200)
+        self.assertEqual(self.call(dad, 'action', {'action': 'decision', 'id': request['id'], 'status': 'Approved', 'reply': 'Yes, after practice', 'addToCalendar': True})[0], 200)
+        updated = next(r for r in self.call(daughter, 'state')[1]['requests'] if r['id'] == request['id'])
+        self.assertEqual(updated['status'], 'Approved')
+        self.assertIn('Yes, after practice', updated['reply'])
+        self.assertEqual(updated['replyBy'], 'Dad')
+        self.assertEqual(updated['responses'][-1]['reply'], 'Yes, after practice')
+        approved_activity = [entry['summary'] for entry in self.call(daughter, 'state')[1]['activity']]
+        self.assertIn('✅ Jermaine approved Arielle’s request "Friends house"', approved_activity)
+        events = [event for event in self.call(daughter, 'state')[1]['events'] if event.get('sourceRequestId') == request['id']]
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0]['date'], events[0]['startTime'], events[0]['description']),
+                         ('2026-10-12', '18:30', 'Her parent will bring me home after dinner.'))
+        self.assertEqual(self.call(dad, 'action', {'action': 'decision', 'id': request['id'], 'status': 'Approved', 'reply': 'Already approved', 'addToCalendar': True})[0], 200)
+        self.assertEqual(sum(1 for e in self.call(daughter, 'state')[1]['events'] if e.get('sourceRequestId') == request['id']), 1)
+
+        self.create(daughter, 'requests', title='Extra screen time', text='May I stay up later?', type='Permission',
+                date='2026-10-15', time='20:00')
+        second = next(r for r in self.call(mom, 'state')[1]['requests'] if r['title'] == 'Extra screen time')
+        self.assertEqual(self.call(mom, 'action', {'action': 'decision', 'id': second['id'], 'status': 'Approved', 'reply': 'Only on Friday.'})[0], 200)
+        self.assertFalse(any(event.get('sourceRequestId') == second['id'] for event in self.call(daughter, 'state')[1]['events']))
+        self.create(daughter, 'requests', title='Sleepover', text='Can Maya sleep over?', type='Sleepover/Friend')
+        denied = next(r for r in self.call(dad, 'state')[1]['requests'] if r['title'] == 'Sleepover')
+        self.assertEqual(self.call(mom, 'action', {'action': 'decision', 'id': denied['id'], 'status': 'Denied', 'reply': 'Not this weekend, please ask again next week.'})[0], 200)
+        denied_request = next(r for r in self.call(daughter, 'state')[1]['requests'] if r['id'] == denied['id'])
+        self.assertEqual((denied_request['status'], denied_request['replyBy']), ('Denied', 'Mom'))
+        self.assertEqual(denied_request['reply'], 'Not this weekend, please ask again next week.')
+        self.assertIn('❌ Stephanie denied Arielle’s request "Sleepover"', [entry['summary'] for entry in self.call(daughter, 'state')[1]['activity']])
+
+    def test_board_reactions_comments_pins_and_important_acknowledgements(self):
+        dad, mom, daughter = [self.client(n) for n in ('Dad', 'Mom', 'Daughter')]
+        self.assertEqual(self.call(daughter, 'action', {
+            'action': 'create', 'kind': 'posts', 'record': {'text': 'Child announcement', 'important': True, 'ackRequired': True},
+        })[0], 403)
+        self.create(dad, 'posts', text='Dance bag needs to be packed tonight', pinned=False, important=True,
+                    ackRequired=True, visibility='Me')
+        post = next(p for p in self.call(daughter, 'state')[1]['posts'] if p['text'] == 'Dance bag needs to be packed tonight')
+        self.assertEqual(post['visibility'], 'Family')
+        self.assertIn(post['id'], [p['id'] for p in self.call(mom, 'state')[1]['posts']])
+        self.assertEqual(self.call(daughter, 'action', {'action': 'react', 'id': post['id'], 'emoji': '❤️'})[0], 200)
+        self.assertEqual(self.call(mom, 'action', {'action': 'comment', 'id': post['id'], 'comment': 'Thanks for the reminder'})[0], 200)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'pin', 'id': post['id'], 'pinned': True})[0], 403)
+        self.assertEqual(self.call(dad, 'action', {'action': 'pin', 'id': post['id'], 'pinned': True})[0], 200)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'ack', 'id': post['id']})[0], 200)
+        state = self.call(mom, 'state')[1]
+        updated = next(p for p in state['posts'] if p['id'] == post['id'])
+        self.assertTrue(updated['pinned'])
+        self.assertTrue(updated['important'])
+        self.assertIn('Daughter', updated['acknowledgedBy'])
+        self.assertTrue(any(c['text'] == 'Thanks for the reminder' for c in updated['comments']))
+        self.assertEqual(self.call(daughter, 'action', {'action': 'delete_comment', 'id': post['id'], 'commentId': next(c['id'] for c in updated['comments'])})[0], 403)
+
+    def test_dance_competition_schedule_privacy_and_calendar_sync(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        start = (server.local_today() + __import__('datetime').timedelta(days=12)).isoformat()
+        end = (server.local_today() + __import__('datetime').timedelta(days=13)).isoformat()
+        self.create(dad, 'dance', title='Harbor Classic', danceType='competition', startDate=start,
+                    endDate=end, venue='Civic Hall', address='10 Main Street', schedulePending=True,
+                    fees=[{'label': 'Entry fee', 'amount': 125}])
+        parent_state = self.call(dad, 'state')[1]
+        competition = next(item for item in parent_state['dance'] if item.get('danceType') == 'competition')
+        self.assertTrue(competition['schedulePending'])
+        self.assertEqual(competition['fees'][0]['amount'], 125)
+        initial_events = [event for event in parent_state['events'] if event.get('sourceDanceId') == competition['id']]
+        self.assertEqual({event['sourceDanceKey']: event['date'] for event in initial_events}, {
+            'competition': start, 'competition:end': end,
+        })
+
+        child_state = self.call(daughter, 'state')[1]
+        child_competition = next(item for item in child_state['dance'] if item['id'] == competition['id'])
+        self.assertNotIn('fees', child_competition)
+        self.assertNotIn('125', json.dumps(child_state))
+
+        updated_date = (server.local_today() + __import__('datetime').timedelta(days=14)).isoformat()
+        updated_end_date = (server.local_today() + __import__('datetime').timedelta(days=15)).isoformat()
+        status, _ = self.call(dad, 'action', {'action': 'edit', 'id': competition['id'], 'record': {
+            'startDate': updated_date, 'endDate': updated_end_date, 'schedulePending': False, 'performanceSchedule': 'Solo 10:15 AM',
+        }})
+        self.assertEqual(status, 200, _)
+        updated_state = self.call(dad, 'state')[1]
+        updated = next(item for item in updated_state['dance'] if item['id'] == competition['id'])
+        self.assertEqual((updated['startDate'], updated['endDate']), (updated_date, updated_end_date))
+        self.assertFalse(updated['schedulePending'])
+        self.assertEqual(updated['performanceSchedule'], 'Solo 10:15 AM')
+        linked_events = [event for event in updated_state['events'] if event.get('sourceDanceId') == competition['id']]
+        self.assertEqual({event['sourceDanceKey']: event['date'] for event in linked_events}, {
+            'competition': updated_date, 'competition:end': updated_end_date,
+        })
+        with server.connection() as db:
+            db.execute("INSERT INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
+                       ('Dad', 'events', linked_events[0]['id'], 'old-date-reminder', 'event_upcoming', updated_date, server.stamp()))
+        third_date = (server.local_today() + __import__('datetime').timedelta(days=16)).isoformat()
+        third_end_date = (server.local_today() + __import__('datetime').timedelta(days=17)).isoformat()
+        status, response = self.call(dad, 'action', {'action': 'edit', 'id': competition['id'], 'record': {
+            'startDate': third_date, 'endDate': third_end_date, 'arrivalTime': '08:15', 'callTime': '09:00',
+            'venue': 'New Civic Hall', 'address': '25 New Street', 'schedulePending': True,
+            'performanceSchedule': '',
+        }})
+        self.assertEqual(status, 200, response)
+        repeated_state = self.call(dad, 'state')[1]
+        repeated = next(item for item in repeated_state['dance'] if item['id'] == competition['id'])
+        self.assertEqual((repeated['startDate'], repeated['endDate']), (third_date, third_end_date))
+        self.assertEqual((repeated['arrivalTime'], repeated['callTime'], repeated['venue'], repeated['address']),
+                         ('08:15', '09:00', 'New Civic Hall', '25 New Street'))
+        self.assertTrue(repeated['schedulePending'])
+        self.assertEqual(len([event for event in repeated_state['events'] if event.get('sourceDanceId') == competition['id']]), 2)
+        self.assertEqual({event['sourceDanceKey']: event['date'] for event in repeated_state['events'] if event.get('sourceDanceId') == competition['id']}, {
+            'competition': third_date, 'competition:end': third_end_date,
+        })
+        with server.connection() as db:
+            stale_reminder = db.execute("SELECT dismissed_at FROM reminders WHERE account='Dad' AND reminder_key='old-date-reminder'").fetchone()
+            self.assertTrue(stale_reminder['dismissed_at'])
+        self.assertEqual(next(item for item in self.call(daughter, 'state')[1]['dance'] if item['id'] == competition['id'])['startDate'], third_date)
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': linked_events[0]['id'], 'record': {'date': updated_date}})[0], 403)
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': linked_events[0]['id']})[0], 403)
+
+    def test_dance_routines_costumes_and_checklists(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        competition_date = (server.local_today() + __import__('datetime').timedelta(days=20)).isoformat()
+        self.create(dad, 'dance', title='Spring Showcase', danceType='competition', startDate=competition_date)
+        competition = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Spring Showcase')
+        self.create(dad, 'dance', title='Moonlight', danceType='routine', routineType='Solo',
+                    choreographer='Ms. Lee', competitionIds=[competition['id']], scheduleInformation='Studio 2, Thursdays')
+        routine = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Moonlight')
+        self.create(dad, 'dance', title='Moonlight costume', danceType='costume', routineIds=[routine['id']],
+                    ordered=True, received=False, alterationsNeeded=True, alterationsCompleted=False,
+                    accessories='Hairpiece', shoes='Tan jazz shoes', tights='Pink tights', neededBy=competition_date)
+        self.create(dad, 'dance', title='Competition Packing', danceType='checklist', competitionId=competition['id'],
+                    checklistItems=['Costume', 'Shoes', 'Tights', 'Water'])
+
+        daughter_dance = self.call(daughter, 'state')[1]['dance']
+        visible_routine = next(item for item in daughter_dance if item.get('title') == 'Moonlight')
+        visible_costume = next(item for item in daughter_dance if item.get('danceType') == 'costume')
+        checklist = next(item for item in daughter_dance if item.get('danceType') == 'checklist')
+        self.assertEqual(visible_routine['competitionIds'], [competition['id']])
+        self.assertEqual(visible_costume['routineIds'], [routine['id']])
+        self.assertTrue(visible_costume['alterationsNeeded'])
+        self.assertEqual([item['text'] for item in checklist['checklistItems']], ['Costume', 'Shoes', 'Tights', 'Water'])
+        self.assertEqual(self.call(daughter, 'action', {'action': 'checklist_item', 'id': checklist['id'], 'itemId': 1})[0], 200)
+        updated_checklist = next(item for item in self.call(dad, 'state')[1]['dance'] if item['id'] == checklist['id'])
+        self.assertTrue(updated_checklist['checklistItems'][0]['checked'])
+        self.assertEqual(self.call(daughter, 'action', {'action': 'edit', 'id': routine['id'], 'record': {'title': 'Hijacked'}})[0], 403)
+
+    def test_competition_deadlines_sync_without_duplicates_and_validate_associations(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        start = (server.local_today() + __import__('datetime').timedelta(days=10)).isoformat()
+        deadline_date = (server.local_today() + __import__('datetime').timedelta(days=5)).isoformat()
+        self.create(dad, 'dance', title='Autumn Classic', danceType='competition', startDate=start,
+                    endDate=start, venue='Civic Hall', schedulePending=True,
+                    deadlines=[{'id': 'registration', 'title': 'Registration due', 'date': deadline_date}],
+                    fees=[{'label': 'Entry fee', 'amount': 125}])
+        competition = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Autumn Classic')
+        primary_id = competition['id']
+        daughter_state = self.call(daughter, 'state')[1]
+        generated = [event for event in daughter_state['events'] if event.get('sourceDanceId') == primary_id]
+        self.assertEqual(len(generated), 2)
+        self.assertEqual({event['sourceDanceKey'] for event in generated}, {'competition', 'deadline:registration'})
+        self.assertNotIn('fees', next(item for item in daughter_state['dance'] if item['id'] == primary_id))
+        self.assertNotIn('125', json.dumps(daughter_state))
+
+        updated_deadline = (server.local_today() + __import__('datetime').timedelta(days=6)).isoformat()
+        status, response = self.call(dad, 'action', {'action': 'edit', 'id': primary_id, 'record': {
+            'deadlines': [{'id': 'registration', 'title': 'Updated registration deadline', 'date': updated_deadline}],
+            'schedulePending': False, 'performanceSchedule': 'Solo 10:15 AM',
+        }})
+        self.assertEqual(status, 200, response)
+        updated_events = [event for event in self.call(daughter, 'state')[1]['events'] if event.get('sourceDanceId') == primary_id]
+        self.assertEqual(len(updated_events), 2)
+        linked_deadline = next(event for event in updated_events if event.get('sourceDanceKey') == 'deadline:registration')
+        self.assertEqual(linked_deadline['date'], updated_deadline)
+        self.assertIn('Updated registration deadline', linked_deadline['title'])
+
+        routine_status, routine = self.call(dad, 'action', {'action': 'create', 'kind': 'dance', 'record': {
+            'title': 'Autumn Solo', 'danceType': 'routine', 'routineType': 'Solo', 'competitionIds': [primary_id],
+        }})
+        self.assertEqual(routine_status, 200, routine)
+        routine_id = next(item['id'] for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Autumn Solo')
+        status, response = self.call(dad, 'action', {'action': 'edit', 'id': primary_id, 'record': {'routineIds': [routine_id]}})
+        self.assertEqual(status, 200, response)
+        self.assertIn(routine_id, next(item for item in self.call(dad, 'state')[1]['dance'] if item['id'] == primary_id)['routineIds'])
+        invalid, response = self.call(dad, 'action', {'action': 'create', 'kind': 'dance', 'record': {
+            'title': 'Broken Routine', 'danceType': 'routine', 'competitionIds': [999999],
+        }})
+        self.assertEqual(invalid, 400, response)
+
+    def test_competition_deadline_completion_resolves_dance_badge_and_linked_reminder(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        start = (server.local_today() + __import__('datetime').timedelta(days=15)).isoformat()
+        deadline_date = (server.local_today() + __import__('datetime').timedelta(days=2)).isoformat()
+        self.create(dad, 'dance', title='Deadline Test Comp', danceType='competition', startDate=start,
+                    schedulePending=False, deadlines=[{'id': 'payment', 'title': 'Payment due', 'date': deadline_date}],
+                    reminderOffsets=[0])
+        competition = next(item for item in self.call(daughter, 'state')[1]['dance'] if item.get('title') == 'Deadline Test Comp')
+        daughter_state = self.call(daughter, 'state')[1]
+        attention = next(item for item in daughter_state['danceAttention'] if item['id'] == competition['id'])
+        self.assertIn('Payment due', ' '.join(attention['reasons']))
+        self.assertEqual(daughter_state['badgeCounts']['dance'], 1)
+        dance_notices = [item for item in daughter_state['reminders'] if item['notificationCategory'] == 'dance' and item['sourceId'] == competition['id'] and not item['read']]
+        for notice in dance_notices:
+            self.assertEqual(self.call(daughter, 'reminders/action', {'id': notice['id'], 'action': 'read'})[0], 200)
+        self.assertEqual(self.call(daughter, 'state')[1]['badgeCounts']['dance'], 1)
+        linked_event = next(event for event in daughter_state['events'] if event.get('sourceDanceId') == competition['id'] and event.get('sourceDanceKey') == 'deadline:payment')
+        with server.connection() as db:
+            db.execute("INSERT INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
+                       ('Daughter', 'events', linked_event['id'], 'dance-deadline-test', 'event_upcoming', deadline_date, server.stamp()))
+
+        self.assertEqual(self.call(daughter, 'action', {'action': 'deadline_done', 'id': competition['id'], 'deadlineId': 'payment'})[0], 200)
+        completed_state = self.call(daughter, 'state')[1]
+        self.assertFalse(any(item['id'] == competition['id'] for item in completed_state['danceAttention']))
+        self.assertEqual(completed_state['badgeCounts']['dance'], 0)
+        completed = next(item for item in completed_state['dance'] if item['id'] == competition['id'])
+        self.assertTrue(completed['deadlines'][0]['completed'])
+        self.assertIn('completed a competition deadline', ' '.join(item['summary'] for item in completed_state['activity']))
+        with server.connection() as db:
+            reminder = db.execute("SELECT dismissed_at FROM reminders WHERE reminder_key='dance-deadline-test'").fetchone()
+            self.assertTrue(reminder['dismissed_at'])
+            before = db.execute("SELECT COUNT(*) FROM audit WHERE record_id=? AND action='deadline_completed'", (competition['id'],)).fetchone()[0]
+        self.assertEqual(self.call(daughter, 'action', {'action': 'deadline_done', 'id': competition['id'], 'deadlineId': 'payment'})[0], 200)
+        with server.connection() as db:
+            after = db.execute("SELECT COUNT(*) FROM audit WHERE record_id=? AND action='deadline_completed'", (competition['id'],)).fetchone()[0]
+        self.assertEqual(after, before)
+
+    def test_dance_me_only_and_adult_records_are_filtered_server_side(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        with server.connection() as db:
+            for creator, visibility, title in (
+                ('Dad', 'Me', 'Jermaine private dance budget'),
+                ('Mom', 'Me', 'Stephanie private dance budget'),
+                ('Dad', 'Adults', 'Adult dance budget'),
+            ):
+                db.execute('INSERT INTO records(kind,body) VALUES(?,?)', ('dance', json.dumps({
+                    'title': title, 'danceType': 'competition', 'visibility': visibility, 'creator': creator,
+                    'fees': [{'label': 'Entry fee', 'amount': 125}], 'financials': {'total': 125},
+                })))
+        daughter_state = self.call(daughter, 'state')[1]
+        self.assertFalse(any('budget' in item.get('title', '') for item in daughter_state['dance']))
+        self.assertNotIn('125', json.dumps(daughter_state))
+        self.assertNotIn('Jermaine private dance budget', json.dumps(self.call(mom, 'state')[1]))
+        self.assertNotIn('Stephanie private dance budget', json.dumps(self.call(dad, 'state')[1]))
+
+    def test_chore_streak_excludes_unrelated_tasks_and_achievements_are_stable(self):
+        daughter = self.client('Daughter')
+        today = server.local_today()
+        dates = [today - __import__('datetime').timedelta(days=offset) for offset in range(6, -1, -1)]
+        with server.connection() as db:
+            for index in range(25):
+                day = dates[index] if index < 6 else dates[6]
+                completed_at = __import__('datetime').datetime.combine(day, __import__('datetime').time(12), server.family_timezone()).isoformat()
+                task = {'title': f'Chore {index}', 'category': 'Home', 'who': 'Daughter', 'creator': 'Dad',
+                        'visibility': 'Family', 'chore': True, 'status': 'done',
+                        'completedBy': 'Daughter', 'completedAt': completed_at,
+                        'completionHistory': [{'completedBy': 'Daughter', 'completedAt': completed_at}]}
+                db.execute('INSERT INTO records(kind,body) VALUES(?,?)', ('tasks', json.dumps(task)))
+            unrelated = {'title': 'Homework', 'category': 'School', 'who': 'Daughter', 'creator': 'Dad',
+                         'visibility': 'Family', 'chore': True, 'status': 'done', 'completedBy': 'Daughter',
+                         'completedAt': __import__('datetime').datetime.combine(today, __import__('datetime').time(13), server.family_timezone()).isoformat(),
+                         'completionHistory': [{'completedBy': 'Daughter', 'completedAt': __import__('datetime').datetime.combine(today, __import__('datetime').time(13), server.family_timezone()).isoformat()}]}
+            db.execute('INSERT INTO records(kind,body) VALUES(?,?)', ('tasks', json.dumps(unrelated)))
+            private = dict(unrelated, title='Private dance chore', category='Home', chore=True,
+                           visibility='Adults', completionHistory=[{'completedBy': 'Daughter', 'completedAt': __import__('datetime').datetime.combine(today, __import__('datetime').time(14), server.family_timezone()).isoformat()}])
+            db.execute('INSERT INTO records(kind,body) VALUES(?,?)', ('tasks', json.dumps(private)))
+
+        state = self.call(daughter, 'state')[1]
+        self.assertEqual(state['points'], 25)
+        self.assertEqual(state['streak'], 7)
+        self.assertFalse(next(task for task in state['tasks'] if task['title'] == 'Homework')['chore'])
+        self.assertEqual({achievement['id'] for achievement in state['achievements'] if achievement['earned']},
+                         {'streak_7', 'chores_25', 'perfect_week'})
+        second_read = self.call(daughter, 'state')[1]
+        self.assertEqual(state['achievements'], second_read['achievements'])
+        self.assertEqual(len({achievement['id'] for achievement in state['achievements']}), len(state['achievements']))
+        self.assertNotIn('Private dance chore', [task['title'] for task in state['tasks']])
+
+    def test_only_parents_can_issue_family_recognition(self):
+        dad, daughter = self.client('Dad'), self.client('Daughter')
+        self.assertEqual(self.call(daughter, 'action', {'action': 'create', 'kind': 'recognitions', 'record': {
+            'recognitionType': 'Proud of You', 'message': 'You worked hard today.'}})[0], 403)
+        self.create(dad, 'recognitions', recognitionType='Proud of You', message='You worked hard today.')
+        state = self.call(daughter, 'state')[1]
+        self.assertEqual(state['recognitions'][0]['recognitionType'], 'Proud of You')
+        self.assertIn('🌟 Jermaine recognized Arielle: Proud of You', [entry['summary'] for entry in state['activity']])
+        self.create(dad, 'tasks', title='Pack dance bag', who='Daughter', category='Home', visibility='Family')
+        task = next(item for item in self.call(daughter, 'state')[1]['tasks'] if item['title'] == 'Pack dance bag')
+        self.assertEqual(self.call(dad, 'action', {'action': 'create', 'kind': 'recognitions', 'record': {
+            'recognitionType': 'Great Job', 'sourceTaskId': task['id'],
+        }})[0], 400)
+        self.assertEqual(self.call(daughter, 'action', {'action': 'done', 'id': task['id']})[0], 200)
+        self.assertEqual(self.call(dad, 'action', {'action': 'create', 'kind': 'recognitions', 'record': {
+            'recognitionType': 'Great Job', 'sourceTaskId': task['id'],
+        }})[0], 200)
+
+    def test_competition_delete_removes_only_generated_calendar_data_and_unlinks_associations(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        date = (server.local_today() + __import__('datetime').timedelta(days=30)).isoformat()
+        self.create(dad, 'events', title='Unrelated family dinner', date=date, category='Family', allDay=True)
+        self.create(dad, 'tasks', title='Unrelated family task', who='Everyone', category='Home', visibility='Family')
+        self.create(dad, 'dance', title='Delete Me Classic', danceType='competition', startDate=date,
+                    endDate=date, deadlines=[{'id': 'entry', 'title': 'Entry due', 'date': date}],
+                    fees=[{'label': 'Entry fee', 'amount': 125}])
+        state = self.call(dad, 'state')[1]
+        competition = next(item for item in state['dance'] if item.get('title') == 'Delete Me Classic')
+        competition_events = [event for event in state['events'] if event.get('sourceDanceId') == competition['id']]
+        self.assertEqual(len(competition_events), 2)
+        with server.connection() as db:
+            for event in competition_events:
+                db.execute("INSERT INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
+                           ('Daughter', 'events', event['id'], f"delete-test:{event['id']}", 'event_upcoming', date, server.stamp()))
+        self.create(dad, 'dance', title='Independent Routine', danceType='routine', competitionIds=[competition['id']])
+        routine = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Independent Routine')
+        self.create(dad, 'dance', title='Unrelated Routine', danceType='routine')
+        unrelated_routine = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Unrelated Routine')
+        self.create(dad, 'dance', title='Independent Costume', danceType='costume', routineIds=[routine['id']])
+        costume = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Independent Costume')
+        self.create(dad, 'dance', title='Independent Checklist', danceType='checklist', competitionId=competition['id'], checklistItems=['Shoes'])
+        checklist = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Independent Checklist')
+        self.assertEqual(self.call(daughter, 'action', {'action': 'delete', 'id': competition['id']})[0], 403)
+
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': competition['id']})[0], 200)
+        parent_state = self.call(dad, 'state')[1]
+        daughter_state = self.call(daughter, 'state')[1]
+        for state_after in (parent_state, daughter_state):
+            self.assertNotIn(competition['id'], [item['id'] for item in state_after['dance']])
+            self.assertFalse(any(event.get('sourceDanceId') == competition['id'] for event in state_after['events']))
+            self.assertIn('Unrelated family dinner', [event['title'] for event in state_after['events']])
+            self.assertIn('Unrelated family task', [item['title'] for item in state_after['tasks']])
+            self.assertNotIn('Delete Me Classic', json.dumps(state_after['reminders']))
+        remaining_dance = {item['id']: item for item in daughter_state['dance']}
+        self.assertEqual(remaining_dance[routine['id']]['competitionIds'], [])
+        self.assertIn(unrelated_routine['id'], remaining_dance)
+        self.assertEqual(remaining_dance[checklist['id']]['competitionId'], None)
+        self.assertIn(costume['id'], remaining_dance)
+        self.assertIn('🗑️ Jermaine deleted "Delete Me Classic"', [event['summary'] for event in daughter_state['activity']])
+        with server.connection() as db:
+            self.assertEqual(db.execute('SELECT deleted FROM records WHERE id=?', (competition['id'],)).fetchone()['deleted'], 1)
+            self.assertTrue(all(db.execute('SELECT dismissed_at FROM reminders WHERE reminder_key=?', (f"delete-test:{event['id']}",)).fetchone()['dismissed_at'] for event in competition_events))
+
+    def test_recognition_seen_receipts_are_daughter_only_and_persist_across_login(self):
+        dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
+        self.create(dad, 'recognitions', recognitionType='Great Job', message='You did it!')
+        first = next(item for item in self.call(daughter, 'state')[1]['recognitions'] if item['recognitionType'] == 'Great Job')
+        self.assertFalse(first['seenAt'])
+        self.assertEqual(self.call(mom, 'recognitions/action', {'action': 'seen', 'id': first['id']})[0], 403)
+
+        self.create(mom, 'recognitions', recognitionType='Proud of You', message='Keep shining!')
+        unseen = [item for item in self.call(daughter, 'state')[1]['recognitions'] if not item['seenAt']]
+        self.assertEqual(len(unseen), 2)
+        self.assertEqual(self.call(daughter, 'recognitions/action', {'action': 'seen', 'id': first['id']})[0], 200)
+        refreshed = self.call(daughter, 'state')[1]['recognitions']
+        self.assertTrue(next(item for item in refreshed if item['id'] == first['id'])['seenAt'])
+        self.assertEqual(sum(not item['seenAt'] for item in refreshed), 1)
+        self.assertEqual(self.call(dad, 'recognitions/action', {'action': 'seen', 'id': unseen[1]['id']})[0], 403)
+
+        self.assertEqual(self.call(daughter, 'logout', {})[0], 200)
+        self.create(dad, 'recognitions', recognitionType='Nice Work', message='Welcome back!')
+        daughter = self.client('Daughter')
+        after_login = self.call(daughter, 'state')[1]['recognitions']
+        self.assertTrue(any(item['recognitionType'] == 'Nice Work' and not item['seenAt'] for item in after_login))
+        self.assertEqual(self.call(daughter, 'recognitions/action', {'action': 'seen', 'id': first['id']})[0], 200)
+        self.assertTrue(next(item for item in self.call(daughter, 'state')[1]['recognitions'] if item['id'] == first['id'])['seenAt'])
 
 if __name__ == '__main__':
     unittest.main()

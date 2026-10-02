@@ -14,15 +14,23 @@ the ZIP. The archive remains unchanged as the historical prototype.
   palette, colorful family tiles, larger touch targets, and celebrations.
 - Tasks and Family Chore Board: Normal / Important / High / Urgent, assignment,
   mandatory urgent acknowledgement, completion, and not-completed reasons.
-- Daughter completion points, UTC daily completion streak, first-win / ten-win
-  achievements; seven-day completion and post counts in Weekly Recap.
+- Daughter's qualifying home-chores, UTC daily chore streak, and extensible
+  achievements for streaks, completion milestones, and a perfect week.
+- Weekly Recap with task and chore outcomes, streaks, achievements, upcoming
+  events, and positive family highlights; parents also see household follow-up.
 - Ask Parents: requests and parent-only approval/denial with reply/conditions.
 - Bulletin Board with per-person toggled reactions.
-- Shared Calendar with dated events and Tomorrow Prep.
+- Shared Calendar with dated events, competition dates/deadlines, and
+  privacy-filtered Tomorrow Prep for schedule, tasks, packing, and reminders.
 - Shared checklist items; Dance Hub with separate Competitions, Schedule,
-  Routines, Costumes, and Checklists sections.
+-  Routines, Costumes, and Dance Checklists sections, including routine and
+  costume associations, competition schedule status, travel details, and
+  individually checkable packing lists.
+- Parent-issued positive recognition for Arielle's completed work.
 - Adult Vault notes and Me Only notes; private activity history.
 - In-app reminders for open High/Urgent tasks.
+- Per-user numbered badges for unseen and actionable tasks, requests, board posts,
+  dance/calendar updates, shared lists, weekly recap, recognition, and reminders.
 - Installable web manifest, Android/iPhone icons, public-shell-only service worker.
 - Individual passwords, HttpOnly sessions, server-side authorization,
   shared SQLite database, refresh every five seconds while the app is visible.
@@ -103,9 +111,9 @@ replicas with separate disks or put the database on a network filesystem.
   subscriptions/VAPID infrastructure, scheduling, consent, and device tests.
 - No offline private-data access or queued writes. Connection failures keep edits
   unsent and show an error; reconnect to save. Service worker caches public assets only.
-- Calendar has dated entries, not recurrence, external calendar sync, or timed alarms.
-  Lists are shared checklist items; dance sections hold checkable notes. Rich editing,
-  recurring chores, attachments, and automatic daily resets are future work.
+- Calendar has dated entries, not external calendar sync or timed alarms.
+  Dance competition dates and deadlines are linked to the family calendar.
+  Attachments and automatic daily resets are future work.
 - Streaks use UTC completion days, not the family's local timezone.
   Historical records are retained; no records are prepopulated.
 - Perform Android/iPhone installation, accessibility, and HTTPS browser acceptance
