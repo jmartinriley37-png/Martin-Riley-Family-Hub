@@ -1,9 +1,13 @@
 import http.cookiejar
 import json
+import os
 import sqlite3
 import threading
 import tempfile
 import io
+import uuid
+import datetime as real_datetime
+import types
 from email.message import Message
 from http.cookies import SimpleCookie
 import unittest
@@ -11,35 +15,132 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 import server
+
+# The same HTTP/API suite runs on either backend: HUB_TEST_BACKEND=sqlite (default) or postgres.
+# PostgreSQL runs need HUB_TEST_POSTGRES_URL pointing at a disposable database; each class gets a private schema.
+BACKEND = os.environ.get('HUB_TEST_BACKEND', 'sqlite')
+PG_URL = os.environ.get('HUB_TEST_POSTGRES_URL', '')
+
+# Tests run at a fixed instant (20:00 UTC on a Saturday, after every reminder trigger of the day) in a fixed
+# timezone, so results never depend on the real clock, HUB_TIMEZONE or the machine's timezone.
+FROZEN_NOW = real_datetime.datetime(2030, 6, 15, 20, 0, tzinfo=real_datetime.timezone.utc)
+
+class FrozenDateTime(real_datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return FROZEN_NOW.astimezone(tz) if tz else FROZEN_NOW.replace(tzinfo=None)
+
+FROZEN_DT = types.SimpleNamespace(**{name: getattr(real_datetime, name) for name in dir(real_datetime) if not name.startswith('__')})
+FROZEN_DT.datetime = FrozenDateTime
+
+class Row(dict):
+    def __getitem__(self, key):
+        return list(self.values())[key] if isinstance(key, int) else super().__getitem__(key)
+
+class RawCursor:
+    def __init__(self, rows, lastrowid=None):
+        self.rows, self.lastrowid = rows, lastrowid
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+    def fetchall(self):
+        return self.rows
+    def __iter__(self):
+        return iter(self.rows)
+
+class RawDb:
+    """Direct SQL for test set-up and assertions only, with SQLite-style placeholders on both backends."""
+    def __init__(self):
+        self.repo = server.repository()
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return self.repo.__exit__(*args)
+    def __getattr__(self, name):
+        return getattr(self.repo, name)
+    def execute(self, sql, params=()):
+        inserts_record = sql.lstrip().upper().startswith('INSERT INTO RECORDS') and 'RETURNING' not in sql.upper()
+        rows = self.repo._rows(sql + ' RETURNING id' if inserts_record else sql, params)
+        if inserts_record:
+            return RawCursor([], rows[0]['id'])
+        return RawCursor([Row(row) for row in rows])
+
+def raw():
+    return RawDb()
+
+def stored_body(value):
+    return value if isinstance(value, dict) else json.loads(value)
+
+def start_backend(backend, directory, migrate=True):
+    """Point the server at a fresh synthetic database. Returns (cleanups, database_url_or_None)."""
+    cleanups, url = [], None
+    if backend == 'postgres':
+        import psycopg
+        from persistence import migrator
+        if not PG_URL:
+            raise unittest.SkipTest('Set HUB_TEST_POSTGRES_URL to run against PostgreSQL')
+        schema = 't_' + uuid.uuid4().hex[:12]
+        with psycopg.connect(PG_URL, autocommit=True) as admin:
+            admin.execute(f'CREATE SCHEMA {schema}')
+        url = PG_URL + ('&' if '?' in PG_URL else '?') + f'options=-csearch_path%3D{schema}'
+        patch = mock.patch.dict(os.environ, {'HUB_DB_BACKEND': 'postgres', 'HUB_DATABASE_URL': url})
+        patch.start()
+        cleanups.append(patch.stop)
+        def drop():
+            with psycopg.connect(PG_URL, autocommit=True) as admin:
+                admin.execute(f'DROP SCHEMA {schema} CASCADE')
+        cleanups.append(drop)
+        if migrate:
+            with psycopg.connect(url, autocommit=True) as conn:
+                migrator.migrate(conn)
+    else:
+        patch = mock.patch.dict(os.environ, {'HUB_DB_BACKEND': 'sqlite'})
+        patch.start()
+        cleanups.append(patch.stop)
+        previous = server.DB
+        server.DB = str(Path(directory) / ('test-%s.sqlite3' % uuid.uuid4().hex[:8]))
+        cleanups.append(lambda: setattr(server, 'DB', previous))
+    for frozen in (mock.patch.object(server, 'dt', FROZEN_DT), mock.patch.object(server, 'HUB_TIMEZONE', 'UTC')):
+        frozen.start()
+        cleanups.append(frozen.stop)
+    return cleanups, url
+
+def seed_accounts():
+    with raw() as c:
+        for name in ('Dad', 'Mom', 'Daughter'):
+            salt = '01' * 16
+            c.execute('INSERT INTO users(name,salt,hash) VALUES(?,?,?)', (name, salt, server.password_hash('testing-password', salt)))
+
+def wipe():
+    with raw() as c:
+        c.execute("DELETE FROM audit")
+        c.execute("DELETE FROM reminders")
+        c.execute("DELETE FROM recognition_receipts")
+        c.execute("UPDATE notification_settings SET value='0' WHERE name='audit_notification_last_id'")
+        c.execute("DELETE FROM recurrence_occurrences")
+        c.execute("DELETE FROM recurrence_series")
+        c.execute("DELETE FROM records")
+        c.execute("DELETE FROM sessions")
+        c.execute("DELETE FROM attempts")
 
 class FamilyPrivacyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
-        server.DB = str(Path(cls.temp.name) / 'test.sqlite3')
+        cls.cleanups, _ = start_backend(BACKEND, cls.temp.name)
         server.initialize()
-        with server.connection() as c:
-            for name in ('Dad', 'Mom', 'Daughter'):
-                salt = '01' * 16
-                c.execute('INSERT INTO users(name,salt,hash) VALUES(?,?,?)', (name, salt, server.password_hash('testing-password', salt)))
+        seed_accounts()
 
 
     @classmethod
     def tearDownClass(cls):
+        for cleanup in reversed(cls.cleanups):
+            cleanup()
         cls.temp.cleanup()
 
     def setUp(self):
-        with server.connection() as c:
-            c.execute("DELETE FROM audit")
-            c.execute("DELETE FROM reminders")
-            c.execute("DELETE FROM recognition_receipts")
-            c.execute("UPDATE notification_settings SET value='0' WHERE name='audit_notification_last_id'")
-            c.execute("DELETE FROM recurrence_occurrences")
-            c.execute("DELETE FROM recurrence_series")
-            c.execute("DELETE FROM records")
-            c.execute("DELETE FROM sessions")
-            c.execute("DELETE FROM attempts")
+        wipe()
 
     def client(self, name):
         client = {}
@@ -77,6 +178,7 @@ class FamilyPrivacyTests(unittest.TestCase):
     def create(self, client, kind, **record):
         self.assertEqual(self.call(client, 'action', dict(action='create', kind=kind, record=record))[0], 200)
 
+    @unittest.skipUnless(BACKEND == 'sqlite', 'upgrades a pre-profile SQLite file; PostgreSQL schema comes only from migrations')
     def test_existing_account_database_gets_display_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
             old_db = Path(directory) / 'pre-profile.sqlite3'
@@ -91,7 +193,7 @@ class FamilyPrivacyTests(unittest.TestCase):
             server.DB = str(old_db)
             try:
                 server.initialize()
-                with server.connection() as c:
+                with raw() as c:
                     self.assertEqual(server.profile_data(c), {
                         'Dad': {'displayName': 'Jermaine', 'role': 'ADMIN'},
                         'Mom': {'displayName': 'Stephanie', 'role': 'ADMIN'},
@@ -105,7 +207,7 @@ class FamilyPrivacyTests(unittest.TestCase):
                     self.assertEqual(c.execute("SELECT COUNT(*) FROM notification_settings WHERE name='audit_notifications_started_at'").fetchone()[0], 1)
                     self.assertEqual(c.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()[0], '1')
                 server.initialize()
-                with server.connection() as c:
+                with raw() as c:
                     self.assertEqual(c.execute("SELECT COUNT(*) FROM notification_settings WHERE name='audit_notifications_started_at'").fetchone()[0], 1)
                     self.assertEqual(c.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()[0], '1')
             finally:
@@ -268,11 +370,11 @@ class FamilyPrivacyTests(unittest.TestCase):
 
         second_daughter_session = self.client('Daughter')
         self.assertEqual(self.call(second_daughter_session, 'state')[1]['badgeCounts'], daughter_state['badgeCounts'])
-        with server.connection() as db:
+        with raw() as db:
             notification_rows_before = db.execute("SELECT COUNT(*) FROM reminders WHERE account='Daughter' AND reminder_key LIKE 'notice:%'").fetchone()[0]
             audit_cursor_before = int(db.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()['value'])
         self.call(second_daughter_session, 'state')
-        with server.connection() as db:
+        with raw() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM reminders WHERE account='Daughter' AND reminder_key LIKE 'notice:%'").fetchone()[0], notification_rows_before)
             self.assertEqual(int(db.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()['value']), audit_cursor_before)
         request_notice = next(item for item in daughter_state['reminders'] if item['type'] == 'request_update' and item['sourceId'] == request['id'])
@@ -403,7 +505,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertNotIn(task_id, [t['id'] for t in self.call(dad, 'state')[1]['tasks']])
         deleted_events = [e for e in self.call(dad, 'state')[1]['activity'] if e['recordId'] == task_id]
         self.assertEqual([e['action'] for e in deleted_events][0], 'delete')
-        with server.connection() as c:
+        with raw() as c:
             self.assertEqual(c.execute('SELECT deleted FROM records WHERE id=?', (task_id,)).fetchone()['deleted'], 1)
             self.assertEqual(c.execute('SELECT COUNT(*) FROM audit WHERE record_id=?', (task_id,)).fetchone()[0], 7)
 
@@ -454,7 +556,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertEqual(self.call(daughter, 'action', {'action': 'edit', 'id': vault['id'], 'record': {'title': 'Leaked'}})[0], 404)
         self.assertEqual(self.call(daughter, 'action', {'action': 'delete', 'id': vault['id']})[0], 404)
         self.assertEqual(self.call(mom, 'action', {'action': 'edit', 'id': vault['id'], 'record': {'notes': 'Updated by Stephanie'}})[0], 200)
-        with server.connection() as db:
+        with raw() as db:
             cursor = db.execute('INSERT INTO records(kind,body) VALUES(?,?)', ('notes', json.dumps({
                 'space': 'Vault', 'visibility': 'Family', 'title': 'Malformed legacy private vault note',
                 'category': 'Other', 'notes': 'Must remain hidden regardless of visibility.' , 'creator': 'Dad',
@@ -539,7 +641,7 @@ class FamilyPrivacyTests(unittest.TestCase):
             'role': 'MANAGED CHILD PROFILE', 'hasAccount': False, 'managedBy': ['Dad', 'Mom'], 'avatar': '⚾',
         })
         self.assertNotIn('Maddox', dad_state['profiles'])
-        with server.connection() as db:
+        with raw() as db:
             self.assertIsNone(db.execute("SELECT name FROM users WHERE name='Maddox'").fetchone())
             self.assertEqual(db.execute("SELECT COUNT(*) FROM sessions s JOIN users u ON u.name=s.name WHERE u.name='Maddox'").fetchone()[0], 0)
             db.execute("INSERT INTO family_members(member_id,display_name,member_type,account_name,managed_by,avatar) VALUES(?,?,?,NULL,?,?)",
@@ -680,7 +782,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         dad, daughter = self.client('Dad'), self.client('Daughter')
         self.create(dad, 'dance', title='Solo Routine', danceType='routine')
         routine = next(item for item in self.call(dad, 'state')[1]['dance'] if item['title'] == 'Solo Routine')
-        with server.connection() as db:
+        with raw() as db:
             server.audit_record(db, 'Dad', routine['id'], 'competition_unlinked',
                                 {**routine, 'id': routine['id']},
                                 {'competitionId': 987654, 'before': {'parentNotes': 'Never show this private audit detail'}})
@@ -795,7 +897,7 @@ class FamilyPrivacyTests(unittest.TestCase):
             with clients['Dad'].open(base + 'state') as response:
                 dad_after_delete = json.load(response)
             self.assertIn('🗑️ Jermaine deleted "Dance bag ready"', [event['summary'] for event in dad_after_delete['activity']])
-            with server.connection() as db:
+            with raw() as db:
                 self.assertEqual(db.execute('SELECT deleted FROM records WHERE id=?', (task_id,)).fetchone()['deleted'], 1)
                 self.assertGreaterEqual(db.execute('SELECT COUNT(*) FROM audit WHERE record_id=?', (task_id,)).fetchone()[0], 5)
         finally:
@@ -827,8 +929,8 @@ class FamilyPrivacyTests(unittest.TestCase):
         for parent in (dad, mom):
             parent_request = next(r for r in self.call(parent, 'state')[1]['requests'] if r['id'] == request['id'])
             self.assertEqual(parent_request['description'], request['description'])
-        with server.connection() as db:
-            stored_request = json.loads(db.execute('SELECT body FROM records WHERE id=?', (request['id'],)).fetchone()['body'])
+        with raw() as db:
+            stored_request = stored_body(db.execute('SELECT body FROM records WHERE id=?', (request['id'],)).fetchone()['body'])
         self.assertEqual(stored_request['date'], '2026-10-12')
         self.assertEqual(stored_request['time'], '18:30')
         self.assertEqual(stored_request['description'], 'Her parent will bring me home after dinner.')
@@ -935,7 +1037,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertEqual({event['sourceDanceKey']: event['date'] for event in linked_events}, {
             'competition': updated_date, 'competition:end': updated_end_date,
         })
-        with server.connection() as db:
+        with raw() as db:
             db.execute("INSERT INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
                        ('Dad', 'events', linked_events[0]['id'], 'old-date-reminder', 'event_upcoming', updated_date, server.stamp()))
         third_date = (server.local_today() + __import__('datetime').timedelta(days=16)).isoformat()
@@ -956,7 +1058,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertEqual({event['sourceDanceKey']: event['date'] for event in repeated_state['events'] if event.get('sourceDanceId') == competition['id']}, {
             'competition': third_date, 'competition:end': third_end_date,
         })
-        with server.connection() as db:
+        with raw() as db:
             stale_reminder = db.execute("SELECT dismissed_at FROM reminders WHERE account='Dad' AND reminder_key='old-date-reminder'").fetchone()
             self.assertTrue(stale_reminder['dismissed_at'])
         self.assertEqual(next(item for item in self.call(daughter, 'state')[1]['dance'] if item['id'] == competition['id'])['startDate'], third_date)
@@ -1049,7 +1151,7 @@ class FamilyPrivacyTests(unittest.TestCase):
             self.assertEqual(self.call(daughter, 'reminders/action', {'id': notice['id'], 'action': 'read'})[0], 200)
         self.assertEqual(self.call(daughter, 'state')[1]['badgeCounts']['dance'], 1)
         linked_event = next(event for event in daughter_state['events'] if event.get('sourceDanceId') == competition['id'] and event.get('sourceDanceKey') == 'deadline:payment')
-        with server.connection() as db:
+        with raw() as db:
             db.execute("INSERT INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
                        ('Daughter', 'events', linked_event['id'], 'dance-deadline-test', 'event_upcoming', deadline_date, server.stamp()))
 
@@ -1060,12 +1162,12 @@ class FamilyPrivacyTests(unittest.TestCase):
         completed = next(item for item in completed_state['dance'] if item['id'] == competition['id'])
         self.assertTrue(completed['deadlines'][0]['completed'])
         self.assertIn('completed a competition deadline', ' '.join(item['summary'] for item in completed_state['activity']))
-        with server.connection() as db:
+        with raw() as db:
             reminder = db.execute("SELECT dismissed_at FROM reminders WHERE reminder_key='dance-deadline-test'").fetchone()
             self.assertTrue(reminder['dismissed_at'])
             before = db.execute("SELECT COUNT(*) FROM audit WHERE record_id=? AND action='deadline_completed'", (competition['id'],)).fetchone()[0]
         self.assertEqual(self.call(daughter, 'action', {'action': 'deadline_done', 'id': competition['id'], 'deadlineId': 'payment'})[0], 200)
-        with server.connection() as db:
+        with raw() as db:
             after = db.execute("SELECT COUNT(*) FROM audit WHERE record_id=? AND action='deadline_completed'", (competition['id'],)).fetchone()[0]
         self.assertEqual(after, before)
 
@@ -1087,7 +1189,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         schedule = next(item for item in self.call(dad, 'state')[1]['dance'] if item.get('title') == 'Lifecycle Schedule')
         dance_records = [schedule, routine, competition, costume, checklist]
 
-        with server.connection() as db:
+        with raw() as db:
             for event in self.call(dad, 'state')[1]['events']:
                 if event.get('sourceDanceId') == competition['id']:
                     db.execute("INSERT INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -1104,14 +1206,14 @@ class FamilyPrivacyTests(unittest.TestCase):
             self.assertTrue(archived['archived'])
             self.assertEqual(archived['archivedBy'], 'Dad')
             self.assertTrue(archived['archivedAt'])
-            with server.connection() as db:
+            with raw() as db:
                 before_repeat = db.execute("SELECT COUNT(*) FROM audit WHERE record_id=? AND action='archive'", (record['id'],)).fetchone()[0]
             self.assertEqual(self.call(mom, 'action', {'action': 'archive', 'id': record['id']})[0], 200)
-            with server.connection() as db:
+            with raw() as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE record_id=? AND action='archive'", (record['id'],)).fetchone()[0], before_repeat)
             if record['id'] == competition['id']:
                 self.assertFalse(any(event.get('sourceDanceId') == record['id'] for event in self.call(daughter, 'state')[1]['events']))
-                with server.connection() as db:
+                with raw() as db:
                     self.assertTrue(all(row['dismissed_at'] for row in db.execute("SELECT dismissed_at FROM reminders WHERE reminder_key LIKE 'lifecycle:%'")))
             self.assertEqual(self.call(mom, 'action', {'action': 'restore', 'id': record['id']})[0], 200)
             restored = next(item for item in self.call(daughter, 'state')[1]['dance'] if item['id'] == record['id'])
@@ -1156,7 +1258,7 @@ class FamilyPrivacyTests(unittest.TestCase):
 
     def test_dance_me_only_and_adult_records_are_filtered_server_side(self):
         dad, mom, daughter = [self.client(name) for name in ('Dad', 'Mom', 'Daughter')]
-        with server.connection() as db:
+        with raw() as db:
             for creator, visibility, title in (
                 ('Dad', 'Me', 'Jermaine private dance budget'),
                 ('Mom', 'Me', 'Stephanie private dance budget'),
@@ -1176,7 +1278,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         daughter = self.client('Daughter')
         today = server.local_today()
         dates = [today - __import__('datetime').timedelta(days=offset) for offset in range(6, -1, -1)]
-        with server.connection() as db:
+        with raw() as db:
             for index in range(25):
                 day = dates[index] if index < 6 else dates[6]
                 completed_at = __import__('datetime').datetime.combine(day, __import__('datetime').time(12), server.family_timezone()).isoformat()
@@ -1235,7 +1337,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         competition = next(item for item in state['dance'] if item.get('title') == 'Delete Me Classic')
         competition_events = [event for event in state['events'] if event.get('sourceDanceId') == competition['id']]
         self.assertEqual(len(competition_events), 2)
-        with server.connection() as db:
+        with raw() as db:
             for event in competition_events:
                 db.execute("INSERT INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
                            ('Daughter', 'events', event['id'], f"delete-test:{event['id']}", 'event_upcoming', date, server.stamp()))
@@ -1264,7 +1366,7 @@ class FamilyPrivacyTests(unittest.TestCase):
         self.assertEqual(remaining_dance[checklist['id']]['competitionId'], None)
         self.assertIn(costume['id'], remaining_dance)
         self.assertIn('🗑️ Jermaine deleted "Delete Me Classic"', [event['summary'] for event in daughter_state['activity']])
-        with server.connection() as db:
+        with raw() as db:
             self.assertEqual(db.execute('SELECT deleted FROM records WHERE id=?', (competition['id'],)).fetchone()['deleted'], 1)
             self.assertTrue(all(db.execute('SELECT dismissed_at FROM reminders WHERE reminder_key=?', (f"delete-test:{event['id']}",)).fetchone()['dismissed_at'] for event in competition_events))
 

@@ -6,13 +6,17 @@ import hmac
 import json
 import os
 import secrets
-import sqlite3
+import sys
 import time
 from calendar import monthrange
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from persistence.config import ConfigError
+from persistence.errors import SchemaNotReady, StorageError
+from persistence.runtime import open_repository
 
 ROOT = Path(__file__).parent
 DB = os.environ.get("HUB_DB", str(ROOT / "data" / "hub.sqlite3"))
@@ -46,70 +50,33 @@ DANCE_FIELDS = (
 )
 ACTIVITY_FIELDS = ("memberId", "activityName", "activityType", "organization", "season", "eventType", "date", "startTime", "endTime", "location", "equipmentNotes", "parentNotes", "reminderOffsets", "visibility")
 
-def connection():
-    Path(DB).parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB, timeout=15)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
+def repository():
+    return open_repository(DB)
 
 def initialize():
-    with connection() as c:
-        c.executescript("""
-        PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY, salt TEXT NOT NULL, hash TEXT NOT NULL, display_name TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, name TEXT REFERENCES users(name), expires INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, body TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, actor TEXT, record_id INTEGER REFERENCES records(id), action TEXT, created TEXT, snapshot TEXT NOT NULL DEFAULT '{}', details TEXT NOT NULL DEFAULT '{}');
-        CREATE TABLE IF NOT EXISTS attempts(address TEXT PRIMARY KEY, count INTEGER, reset INTEGER);
-        CREATE TABLE IF NOT EXISTS recurrence_series(series_id INTEGER PRIMARY KEY REFERENCES records(id), active INTEGER NOT NULL DEFAULT 1, rule TEXT NOT NULL, start_date TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '', anchor_sequence INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS recurrence_occurrences(series_id INTEGER NOT NULL REFERENCES recurrence_series(series_id), occurrence_date TEXT NOT NULL, task_id INTEGER NOT NULL UNIQUE REFERENCES records(id), sequence INTEGER NOT NULL, PRIMARY KEY(series_id, occurrence_date));
-        CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL REFERENCES users(name), source_kind TEXT NOT NULL, source_id INTEGER NOT NULL, reminder_key TEXT NOT NULL, reminder_type TEXT NOT NULL, due_at TEXT NOT NULL, created_at TEXT NOT NULL, read_at TEXT, dismissed_at TEXT, snoozed_until TEXT, UNIQUE(account, source_kind, source_id, reminder_key));
-        CREATE TABLE IF NOT EXISTS recognition_receipts(recognition_id INTEGER NOT NULL REFERENCES records(id), recipient TEXT NOT NULL REFERENCES users(name), seen_at TEXT NOT NULL, PRIMARY KEY(recognition_id, recipient));
-        CREATE TABLE IF NOT EXISTS notification_settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS family_members(member_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, member_type TEXT NOT NULL, account_name TEXT UNIQUE REFERENCES users(name), managed_by TEXT NOT NULL DEFAULT '[]', avatar TEXT NOT NULL DEFAULT '');
-        """)
-        columns = {row["name"] for row in c.execute("PRAGMA table_info(users)")}
-        if "display_name" not in columns:
-            c.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
-        record_columns = {row["name"] for row in c.execute("PRAGMA table_info(records)")}
-        if "deleted" not in record_columns:
-            c.execute("ALTER TABLE records ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
-        audit_columns = {row["name"] for row in c.execute("PRAGMA table_info(audit)")}
-        if "snapshot" not in audit_columns:
-            c.execute("ALTER TABLE audit ADD COLUMN snapshot TEXT NOT NULL DEFAULT '{}'")
-        if "details" not in audit_columns:
-            c.execute("ALTER TABLE audit ADD COLUMN details TEXT NOT NULL DEFAULT '{}'")
-        series_columns = {row["name"] for row in c.execute("PRAGMA table_info(recurrence_series)")}
-        if "created_by" not in series_columns:
-            c.execute("ALTER TABLE recurrence_series ADD COLUMN created_by TEXT NOT NULL DEFAULT ''")
-        if "anchor_sequence" not in series_columns:
-            c.execute("ALTER TABLE recurrence_series ADD COLUMN anchor_sequence INTEGER NOT NULL DEFAULT 0")
+    with repository() as c:
+        c.ensure_schema()
         for account, display_name in DEFAULT_DISPLAY_NAMES.items():
-            if c.execute("SELECT 1 FROM users WHERE name=?", (account,)).fetchone():
-                c.execute("INSERT OR IGNORE INTO family_members(member_id,display_name,member_type,account_name) VALUES(?,?,'account',?)", (account, display_name, account))
-                c.execute("UPDATE family_members SET display_name=? WHERE member_id=? AND account_name=?", (display_name, account, account))
-        c.execute("INSERT OR IGNORE INTO family_members(member_id,display_name,member_type,account_name,managed_by,avatar) VALUES('Maddox','Maddox','managed_child',NULL,?,?)",
-                  (json.dumps(["Dad", "Mom"]), "⚾"))
-        c.execute("INSERT OR IGNORE INTO notification_settings(name,value) VALUES('audit_notifications_started_at',?)", (stamp(),))
-        latest_audit_id = c.execute("SELECT COALESCE(MAX(id),0) FROM audit").fetchone()[0]
-        c.execute("INSERT OR IGNORE INTO notification_settings(name,value) VALUES('audit_notification_last_id',?)", (str(latest_audit_id),))
+            if c.get_user(account):
+                c.ensure_family_member(account, display_name, "account", account)
+                c.set_account_member_name(account, account, display_name)
+        c.ensure_family_member("Maddox", "Maddox", "managed_child", None, ["Dad", "Mom"], "⚾")
+        c.set_setting_if_absent("audit_notifications_started_at", stamp())
+        c.set_setting_if_absent("audit_notification_last_id", str(c.max_audit_id()))
         for account, display_name in DEFAULT_DISPLAY_NAMES.items():
-            c.execute("UPDATE users SET display_name=? WHERE name=? AND display_name=''", (display_name, account))
-        for row in c.execute("SELECT id,kind,body FROM records WHERE deleted=0 AND kind IN ('tasks','events')").fetchall():
-            record = json.loads(row["body"])
+            c.backfill_display_name(account, display_name)
+        for row in c.list_records(kinds=("tasks", "events")):
+            record = row["body"]
             repeat = record.get("repeat", "One Time")
             start_date = record.get("dueDate") if row["kind"] == "tasks" else record.get("date", "")[:10]
-            if repeat == "One Time" or not start_date or c.execute("SELECT 1 FROM recurrence_series WHERE series_id=?", (row["id"],)).fetchone():
+            if repeat == "One Time" or not start_date or c.get_series(row["id"], active_only=False):
                 continue
             record.update(seriesId=row["id"], occurrenceDate=start_date, occurrenceNumber=0)
             rule = dict(record, seriesKind=row["kind"])
-            c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(record), row["id"]))
+            c.update_record_body(row["id"], record)
             created_at = record.get("createdAt", stamp())
-            c.execute("INSERT INTO recurrence_series(series_id,rule,start_date,created_at,updated_at,created_by) VALUES(?,?,?,?,?,?)",
-                      (row["id"], json.dumps(rule), start_date, created_at, record.get("updatedAt", created_at), record.get("creator", "")))
-            c.execute("INSERT OR IGNORE INTO recurrence_occurrences(series_id,occurrence_date,task_id,sequence) VALUES(?,?,?,0)",
-                      (row["id"], start_date, row["id"]))
+            c.create_series(row["id"], rule, start_date, created_at, record.get("updatedAt", created_at), record.get("creator", ""))
+            c.add_occurrence_if_absent(row["id"], start_date, row["id"], 0)
 
 def profile_data(c):
     return {
@@ -117,13 +84,15 @@ def profile_data(c):
             "displayName": row["display_name"] or DEFAULT_DISPLAY_NAMES.get(row["name"], row["name"]),
             "role": ACCOUNT_ROLES.get(row["name"], "CHILD"),
         }
-        for row in c.execute("SELECT name, display_name FROM users")
+        for row in c.list_users()
     }
+
+MEMBER_ORDER = {"Dad": 0, "Mom": 1, "Daughter": 2}
 
 def family_member_data(c, profiles=None):
     profiles = profiles if profiles is not None else profile_data(c)
     members = {}
-    for row in c.execute("SELECT * FROM family_members ORDER BY CASE member_id WHEN 'Dad' THEN 0 WHEN 'Mom' THEN 1 WHEN 'Daughter' THEN 2 ELSE 3 END,display_name"):
+    for row in sorted(c.list_family_members(), key=lambda item: (MEMBER_ORDER.get(item["member_id"], 3), item["display_name"])):
         member_id = row["member_id"]
         if row["member_type"] == "account":
             profile = profiles.get(row["account_name"])
@@ -131,20 +100,17 @@ def family_member_data(c, profiles=None):
                 continue
             members[member_id] = {"memberId": member_id, "displayName": profile["displayName"], "profileType": "account", "role": profile["role"], "hasAccount": True, "avatar": row["avatar"]}
         else:
-            try:
-                managed_by = json.loads(row["managed_by"] or "[]")
-            except json.JSONDecodeError:
-                managed_by = []
+            managed_by = row["managed_by"] or []
             members[member_id] = {"memberId": member_id, "displayName": row["display_name"], "profileType": "managed_child", "role": "MANAGED CHILD PROFILE", "hasAccount": False, "managedBy": managed_by, "avatar": row["avatar"]}
     for member_id, profile in profiles.items():
         members.setdefault(member_id, {"memberId": member_id, "displayName": profile["displayName"], "profileType": "account", "role": profile["role"], "hasAccount": True, "avatar": ""})
     return members
 
 def family_member_ids(c):
-    return {row["member_id"] for row in c.execute("SELECT member_id FROM family_members")} | {row["name"] for row in c.execute("SELECT name FROM users")}
+    return {row["member_id"] for row in c.list_family_members()} | {row["name"] for row in c.list_users()}
 
 def managed_member_ids(c):
-    return {row["member_id"] for row in c.execute("SELECT member_id FROM family_members WHERE member_type='managed_child'")}
+    return {row["member_id"] for row in c.list_family_members() if row["member_type"] == "managed_child"}
 
 def normalize_dance_record(source, actor, existing=None):
     record = dict(existing or {})
@@ -258,10 +224,10 @@ def validate_dance_associations(c, record, actor):
         for record_id in ids:
             if record_id is None:
                 continue
-            row = c.execute("SELECT kind,body,deleted FROM records WHERE id=?", (record_id,)).fetchone()
-            if not row or row["kind"] != "dance" or row["deleted"]:
+            row = c.get_record(record_id)
+            if not row or row["kind"] != "dance":
                 raise ValueError("A linked dance item is unavailable")
-            linked = json.loads(row["body"])
+            linked = row["body"]
             if not visible(linked, actor):
                 raise ValueError("A linked dance item is unavailable")
             if linked.get("danceType") != dance_type:
@@ -285,8 +251,10 @@ def unlink_dance_references(c, actor, deleted_id, dance_type, changed_at):
     list_field, scalar_field = reference_fields.get(dance_type, (None, None))
     if not list_field and not scalar_field:
         return
-    for linked_row in c.execute("SELECT id,body FROM records WHERE kind='dance' AND deleted=0 AND id<>?", (deleted_id,)).fetchall():
-        linked = json.loads(linked_row["body"])
+    for linked_row in c.list_records(kind="dance"):
+        if linked_row["id"] == deleted_id:
+            continue
+        linked = linked_row["body"]
         before = {}
         values = linked.get(list_field) if list_field else None
         if isinstance(values, list) and deleted_id in values:
@@ -297,13 +265,12 @@ def unlink_dance_references(c, actor, deleted_id, dance_type, changed_at):
             linked[scalar_field] = None
         if before:
             linked.update(updatedAt=changed_at, updatedBy=actor)
-            c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(linked), linked_row["id"]))
+            c.update_record_body(linked_row["id"], linked)
             audit_record(c, actor, linked_row["id"], "dance_unlinked", {**linked, "id": linked_row["id"]},
                          {"before": before, "sourceDanceId": deleted_id})
 
 def dance_calendar_mirrors(c, dance_id, include_deleted=False):
-    rows = c.execute("SELECT id,body FROM records WHERE kind='events'" + ("" if include_deleted else " AND deleted=0")).fetchall()
-    return [(row["id"], json.loads(row["body"])) for row in rows if json.loads(row["body"]).get("sourceDanceId") == dance_id]
+    return [(row["id"], row["body"]) for row in c.find_by_source("sourceDanceId", dance_id, include_deleted=include_deleted)]
 
 def set_dance_archived(c, actor, record_id, record, archived):
     if not adult(actor):
@@ -320,24 +287,22 @@ def set_dance_archived(c, actor, record_id, record, archived):
         record["restoredBy"] = actor
     record["updatedAt"] = changed_at
     record["updatedBy"] = actor
-    c.execute("UPDATE records SET body=? WHERE id=? AND kind='dance' AND deleted=0", (json.dumps(record), record_id))
-    for event_id, event in dance_calendar_mirrors(c, record_id, include_deleted=True):
-        if c.execute("SELECT deleted FROM records WHERE id=?", (event_id,)).fetchone()["deleted"]:
-            continue
+    c.update_record_body(record_id, record)
+    for event_id, event in dance_calendar_mirrors(c, record_id):
         event["archived"] = archived
         event["updatedAt"] = changed_at
         event["updatedBy"] = actor
         if archived:
             event["archivedAt"] = changed_at
             event["archivedBy"] = actor
-            c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (changed_at, event_id))
         else:
             event["restoredAt"] = changed_at
             event["restoredBy"] = actor
-        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(event), event_id))
+        c.update_record_body(event_id, event)
     if archived:
-        c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE (source_kind='dance' AND source_id=?) OR (source_kind='events' AND source_id IN (SELECT id FROM records WHERE kind='events' AND json_extract(body,'$.sourceDanceId')=?))",
-                  (changed_at, record_id, record_id))
+        c.dismiss_reminders_for_source("dance", record_id, changed_at)
+        for mirror in c.find_by_source("sourceDanceId", record_id, include_deleted=True):
+            c.dismiss_reminders_for_source("events", mirror["id"], changed_at)
     audit_record(c, actor, record_id, "archive" if archived else "restore", {**record, "id": record_id})
     return True
 
@@ -352,14 +317,13 @@ def sync_competition_calendar(c, actor, dance_id, competition):
         return
     linked = {}
     duplicate_ids = []
-    for row in c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0"):
-        event = json.loads(row["body"])
-        if event.get("sourceDanceId") == dance_id:
-            key = event.get("sourceDanceKey", "competition")
-            if key in linked:
-                duplicate_ids.append(row["id"])
-            else:
-                linked[key] = (row["id"], event)
+    for row in c.find_by_source("sourceDanceId", dance_id):
+        event = row["body"]
+        key = event.get("sourceDanceKey", "competition")
+        if key in linked:
+            duplicate_ids.append(row["id"])
+        else:
+            linked[key] = (row["id"], event)
 
     desired = {}
     if competition.get("startDate"):
@@ -404,18 +368,16 @@ def sync_competition_calendar(c, actor, dance_id, competition):
             event["createdAt"] = previous[1].get("createdAt", event["createdAt"])
             event_id = previous[0]
             if any(previous[1].get(field) != event.get(field) for field in ("date", "startTime", "endTime", "reminderOffsets")):
-                c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?",
-                          (stamp(), event_id))
-            c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(event), event_id))
+                c.dismiss_reminders_for_source("events", event_id, stamp())
+            c.update_record_body(event_id, event)
         else:
-            cursor = c.execute("INSERT INTO records(kind,body) VALUES('events',?)", (json.dumps(event),))
-            event_id = cursor.lastrowid
+            event_id = c.create_record("events", event)
             audit_record(c, actor, event_id, "create", {**event, "id": event_id})
 
     for record_id, _event in linked.values():
-        c.execute("UPDATE records SET deleted=1 WHERE id=?", (record_id,))
+        c.soft_delete_record(record_id)
     for record_id in duplicate_ids:
-        c.execute("UPDATE records SET deleted=1 WHERE id=?", (record_id,))
+        c.soft_delete_record(record_id)
 
 def password_hash(password, salt):
     return hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=16384, r=8, p=1).hex()
@@ -626,7 +588,7 @@ def normalize_family_activity(c, source, actor, existing=None):
         if field in source:
             record[field] = source[field]
     member_id = record.get("memberId")
-    member = c.execute("SELECT member_id,member_type FROM family_members WHERE member_id=?", (member_id,)).fetchone()
+    member = c.get_family_member(member_id) if isinstance(member_id, str) else None
     if not member or member["member_type"] != "managed_child":
         raise ValueError("Choose a managed child profile")
     for field in ("activityName", "activityType"):
@@ -660,9 +622,8 @@ def normalize_family_activity(c, source, actor, existing=None):
     return record
 
 def sync_family_activity_calendar(c, actor, activity_id, activity):
-    rows = c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0").fetchall()
-    matches = [(row["id"], json.loads(row["body"])) for row in rows if json.loads(row["body"]).get("sourceActivityId") == activity_id]
-    member = c.execute("SELECT display_name FROM family_members WHERE member_id=?", (activity["memberId"],)).fetchone()
+    matches = [(row["id"], row["body"]) for row in c.find_by_source("sourceActivityId", activity_id)]
+    member = c.get_family_member(activity["memberId"])
     member_name = member["display_name"] if member else activity["memberId"]
     activity_label = activity["activityName"]
     created_at = activity.get("createdAt", stamp())
@@ -681,14 +642,13 @@ def sync_family_activity_calendar(c, actor, activity_id, activity):
     event.update(sourceActivityId=activity_id, sourceActivityKey="schedule", creator=actor, by=actor,
                  createdAt=matches[0][1].get("createdAt", created_at) if matches else created_at, updatedAt=stamp())
     if matches:
-        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(event), matches[0][0]))
+        c.update_record_body(matches[0][0], event)
         for duplicate_id, _ in matches[1:]:
-            c.execute("UPDATE records SET deleted=1 WHERE id=?", (duplicate_id,))
-        c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?",
-                  (event["updatedAt"], matches[0][0]))
+            c.soft_delete_record(duplicate_id)
+        c.dismiss_reminders_for_source("events", matches[0][0], event["updatedAt"])
     else:
-        cursor = c.execute("INSERT INTO records(kind,body) VALUES('events',?)", (json.dumps(event),))
-        audit_record(c, actor, cursor.lastrowid, "create", {**event, "id": cursor.lastrowid})
+        event_id = c.create_record("events", event)
+        audit_record(c, actor, event_id, "create", {**event, "id": event_id})
 
 def family_timezone():
     try:
@@ -725,9 +685,10 @@ def recurrence_date(start_date, repeat, sequence, interval=1):
 def ensure_recurrence_occurrences(c, now=None):
     today = (now or dt.datetime.now(family_timezone())).date()
     horizon = today + dt.timedelta(days=RECURRENCE_HORIZON_DAYS)
-    for series in c.execute("SELECT * FROM recurrence_series WHERE active=1").fetchall():
+    existing = c.occurrence_dates_by_series()
+    for series in c.list_active_series():
         try:
-            rule = json.loads(series["rule"])
+            rule = series["rule"]
             start = dt.date.fromisoformat(series["start_date"])
         except (ValueError, TypeError):
             continue
@@ -737,12 +698,13 @@ def ensure_recurrence_occurrences(c, now=None):
             continue
         interval = rule.get("customIntervalDays", 1)
         anchor_sequence = series["anchor_sequence"]
+        known_dates = existing.setdefault(series["series_id"], set())
         for offset in range(1, RECURRENCE_MAX_OCCURRENCES + 1):
             sequence = anchor_sequence + offset
             occurrence_date = recurrence_date(start, repeat, offset, interval)
             if not occurrence_date or occurrence_date > horizon:
                 break
-            if c.execute("SELECT 1 FROM recurrence_occurrences WHERE series_id=? AND occurrence_date=?", (series["series_id"], occurrence_date.isoformat())).fetchone():
+            if occurrence_date.isoformat() in known_dates:
                 continue
             created_at = stamp()
             occurrence = dict(rule)
@@ -756,10 +718,9 @@ def ensure_recurrence_occurrences(c, now=None):
             if series_kind == "tasks":
                 occurrence.update(status="open", acked=[], acknowledgements=[], reason="",
                                   completionHistory=[], notCompletedHistory=[])
-            cursor = c.execute("INSERT INTO records(kind,body) VALUES(?,?)", (series_kind, json.dumps(occurrence)))
-            task_id = cursor.lastrowid
-            c.execute("INSERT INTO recurrence_occurrences(series_id,occurrence_date,task_id,sequence) VALUES(?,?,?,?)",
-                      (series["series_id"], occurrence_date.isoformat(), task_id, sequence))
+            task_id = c.create_record(series_kind, occurrence)
+            c.add_occurrence(series["series_id"], occurrence_date.isoformat(), task_id, sequence)
+            known_dates.add(occurrence_date.isoformat())
             audit_record(c, rule.get("creator", series["created_by"]), task_id, "recurrence_occurrence_created",
                          {**occurrence, "id": task_id}, {"seriesId": series["series_id"], "sequence": sequence})
 
@@ -787,11 +748,18 @@ def reminder_recipients(record, profiles):
         return [record.get("who")] if record.get("who") in profiles else []
     return list(profiles)
 
-def generate_reminders(c, profiles, now=None):
+def add_reminder(c, known, account, source_kind, source_id, key, reminder_type, due_at, created_at):
+    token = (account, source_kind, source_id, key)
+    if token not in known:
+        c.upsert_reminder(account, source_kind, source_id, key, reminder_type, due_at, created_at)
+        known.add(token)
+
+def generate_reminders(c, profiles, now=None, known=None):
+    known = c.reminder_keys() if known is None else known
     zone = family_timezone()
     current = now or dt.datetime.now(zone)
-    for row in c.execute("SELECT id,kind,body FROM records WHERE deleted=0 AND kind IN ('tasks','events','notes')").fetchall():
-        record = json.loads(row["body"])
+    for row in c.list_records(kinds=("tasks", "events", "notes")):
+        record = row["body"]
         kind = row["kind"]
         if kind == "events" and record.get("sourceDanceId") and record.get("archived"):
             continue
@@ -814,19 +782,16 @@ def generate_reminders(c, profiles, now=None):
                     reminder_type = "event_upcoming" if kind == "events" else "task_due"
                     if kind == "notes":
                         reminder_type = "vault_reminder" if record.get("space") == "Vault" or record.get("visibility") == "Adults" else "me_reminder" if record.get("space") == "Me" or record.get("visibility") == "Me" else "note_reminder"
-                    c.execute("INSERT OR IGNORE INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
-                              (account, kind, row["id"], f"offset:{offset}:{reminder_at.isoformat()}:{record.get('updatedAt','')}", reminder_type, trigger.isoformat(), stamp()))
+                    add_reminder(c, known, account, kind, row["id"], f"offset:{offset}:{reminder_at.isoformat()}:{record.get('updatedAt','')}", reminder_type, trigger.isoformat(), stamp())
             if kind == "tasks" and record.get("status") == "open":
                 acked = set(record.get("acked", []))
                 assignee = record.get("who")
                 requires_ack = bool(record.get("ack")) and (account == assignee or assignee == "Everyone" or not assignee and account == record.get("creator"))
                 if record.get("priority") == "Urgent" and requires_ack and account not in acked:
                     escalation = int(current.timestamp() // 3600)
-                    c.execute("INSERT OR IGNORE INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
-                              (account, kind, row["id"], f"urgent-ack:{escalation}", "urgent_ack", current.isoformat(), stamp()))
+                    add_reminder(c, known, account, kind, row["id"], f"urgent-ack:{escalation}", "urgent_ack", current.isoformat(), stamp())
                 if due_at <= current:
-                    c.execute("INSERT OR IGNORE INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
-                              (account, kind, row["id"], f"overdue:{record.get('updatedAt','')}", "overdue", due_at.isoformat(), stamp()))
+                    add_reminder(c, known, account, kind, row["id"], f"overdue:{record.get('updatedAt','')}", "overdue", due_at.isoformat(), stamp())
 
 def audit_notification_types(kind, action, record, actor, account):
     if actor == account or not visible(record, account):
@@ -856,31 +821,23 @@ def audit_notification_types(kind, action, record, actor, account):
         return ["list_update"]
     return []
 
-def generate_notification_reminders(c, profiles):
-    setting = c.execute("SELECT value FROM notification_settings WHERE name='audit_notifications_started_at'").fetchone()
-    started_at = setting["value"] if setting else stamp()
-    cursor_setting = c.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()
-    last_id = int(cursor_setting["value"]) if cursor_setting else 0
-    high_water = c.execute("SELECT COALESCE(MAX(id),0) FROM audit").fetchone()[0]
-    audits = c.execute("""
-        SELECT a.id,a.actor,a.record_id,a.action,a.created,a.snapshot,r.kind,r.body,r.deleted
-        FROM audit a JOIN records r ON r.id=a.record_id
-        WHERE a.id>? AND a.id<=? AND a.created>=? AND r.deleted=0
-        ORDER BY a.id
-    """, (last_id, high_water, started_at)).fetchall()
-    for audit in audits:
-        current = json.loads(audit["body"])
-        snapshot = json.loads(audit["snapshot"] or "{}")
+def generate_notification_reminders(c, profiles, known=None):
+    known = c.reminder_keys() if known is None else known
+    started_at = c.get_setting("audit_notifications_started_at") or stamp()
+    last_id = int(c.get_setting("audit_notification_last_id") or 0)
+    high_water = c.max_audit_id()
+    for audit in c.list_audit_since(last_id, high_water, started_at):
+        current = audit["record_body"]
+        snapshot = audit["snapshot"]
         if not snapshot:
             snapshot = current
         for account in profiles:
-            for notification_type in audit_notification_types(audit["kind"], audit["action"], snapshot, audit["actor"], account):
+            for notification_type in audit_notification_types(audit["record_kind"], audit["action"], snapshot, audit["actor"], account):
                 if not visible(current, account):
                     continue
                 key = f"notice:{audit['id']}:{notification_type}"
-                c.execute("INSERT OR IGNORE INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
-                          (account, audit["kind"], audit["record_id"], key, notification_type, audit["created"], audit["created"]))
-    c.execute("UPDATE notification_settings SET value=? WHERE name='audit_notification_last_id'", (str(high_water),))
+                add_reminder(c, known, account, audit["record_kind"], audit["record_id"], key, notification_type, audit["created"], audit["created"])
+    c.set_setting("audit_notification_last_id", str(high_water))
 
     today = local_today()
     week_start = today - dt.timedelta(days=today.weekday())
@@ -888,8 +845,7 @@ def generate_notification_reminders(c, profiles):
     week_id = int(week_start.strftime("%Y%m%d"))
     week_due = dt.datetime.combine(week_start, dt.time.min, family_timezone()).astimezone(dt.timezone.utc).isoformat()
     for account in profiles:
-        c.execute("INSERT OR IGNORE INTO reminders(account,source_kind,source_id,reminder_key,reminder_type,due_at,created_at) VALUES(?,?,?,?,?,?,?)",
-                  (account, "recap", week_id, f"weekly-recap:{week_key}", "weekly_recap", week_due, stamp()))
+        add_reminder(c, known, account, "recap", week_id, f"weekly-recap:{week_key}", "weekly_recap", week_due, stamp())
 
 def reminder_category(reminder_type):
     return {
@@ -904,7 +860,7 @@ def reminder_state(c, account, state):
     sources = {(kind, item["id"]): item for kind in KINDS for item in state[kind]}
     result = []
     now = dt.datetime.now(dt.timezone.utc)
-    for row in c.execute("SELECT * FROM reminders WHERE account=? ORDER BY due_at DESC LIMIT 200", (account,)):
+    for row in c.recent_reminders(account, 200):
         source = sources.get((row["source_kind"], row["source_id"]))
         if row["source_kind"] == "recap":
             source = {"title": "Weekly Recap", "category": "Recap", "visibility": "Family"}
@@ -1031,7 +987,7 @@ def edit_record_scope(c, actor, record_id, kind, current, changes, scope, member
     if kind not in {"tasks", "events"} or not adult(actor) or not editable(current, actor):
         raise PermissionError("You cannot edit this item")
     series_id = current.get("seriesId")
-    series = c.execute("SELECT * FROM recurrence_series WHERE series_id=? AND active=1", (series_id,)).fetchone() if series_id else None
+    series = c.get_series(series_id) if series_id else None
     if not series:
         if scope not in {None, "this"}:
             raise ValueError("This item is not part of an active recurring series")
@@ -1054,19 +1010,19 @@ def edit_record_scope(c, actor, record_id, kind, current, changes, scope, member
             updated.update(updatedAt=stamp(), updatedBy=actor)
         else:
             updated.update(updatedAt=stamp(), updatedBy=actor)
-        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(updated), record_id))
+        c.update_record_body(record_id, updated)
         if series and (("dueDate" if kind == "tasks" else "date") in details["after"]):
             date_value = updated.get("dueDate" if kind == "tasks" else "date")
-            c.execute("UPDATE recurrence_occurrences SET occurrence_date=? WHERE task_id=?", (date_value, record_id))
+            c.set_occurrence_date(record_id, date_value)
         if {"dueDate", "dueTime", "date", "startTime", "endTime", "reminderOffsets"} & set(details["after"]):
-            c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind=? AND source_id=?", (updated["updatedAt"], kind, record_id))
+            c.dismiss_reminders_for_source(kind, record_id, updated["updatedAt"])
         return updated, [(record_id, "edit", details)]
 
-    current_occurrence = c.execute("SELECT occurrence_date,sequence FROM recurrence_occurrences WHERE series_id=? AND task_id=?", (series_id, record_id)).fetchone()
+    current_occurrence = c.get_occurrence(series_id, record_id)
     if not current_occurrence:
         raise ValueError("Recurring occurrence index is unavailable")
     sequence = current_occurrence["sequence"]
-    series_rule = json.loads(series["rule"])
+    series_rule = series["rule"]
     normalized_rule = validate(changes, actor, series_rule)
     date_field = "dueDate" if kind == "tasks" else "date"
     current_date = dt.date.fromisoformat(current_occurrence["occurrence_date"])
@@ -1081,10 +1037,10 @@ def edit_record_scope(c, actor, record_id, kind, current, changes, scope, member
         anchor_sequence = series["anchor_sequence"]
 
     occurrences = []
-    for occurrence in c.execute("SELECT o.task_id,o.occurrence_date,o.sequence,r.body,r.deleted FROM recurrence_occurrences o JOIN records r ON r.id=o.task_id WHERE o.series_id=? ORDER BY o.sequence", (series_id,)).fetchall():
+    for occurrence in c.list_series_members(series_id):
         if scope == "future" and occurrence["sequence"] < sequence:
             continue
-        record = json.loads(occurrence["body"])
+        record = occurrence["body"]
         if occurrence["deleted"] or record.get("status") in {"done", "missed"}:
             continue
         normalized = validate(changes, actor, record)
@@ -1106,7 +1062,7 @@ def edit_record_scope(c, actor, record_id, kind, current, changes, scope, member
             scheduled[occurrence["task_id"]] = new_date.isoformat()
         target_ids = set(scheduled)
         for new_date in scheduled.values():
-            conflict = c.execute("SELECT task_id FROM recurrence_occurrences WHERE series_id=? AND occurrence_date=?", (series_id, new_date)).fetchone()
+            conflict = c.get_occurrence_by_date(series_id, new_date)
             if conflict and conflict["task_id"] not in target_ids:
                 raise ValueError("This schedule conflicts with an existing occurrence")
     else:
@@ -1126,43 +1082,47 @@ def edit_record_scope(c, actor, record_id, kind, current, changes, scope, member
             if updated.get(field) != original.get(field):
                 details["before"][field] = original.get(field)
                 details["after"][field] = updated.get(field)
-        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(updated), occurrence["task_id"]))
+        c.update_record_body(occurrence["task_id"], updated)
         audit_events.append((occurrence["task_id"], "edit", details))
         if "who" in details["after"]:
             audit_events.append((occurrence["task_id"], "reassigned", details))
         if {"dueDate", "dueTime", "date", "startTime", "endTime"} & set(details["after"]):
             audit_events.append((occurrence["task_id"], "due_date", details))
         if {"dueDate", "dueTime", "date", "startTime", "endTime", "reminderOffsets"} & set(details["after"]):
-            c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind=? AND source_id=?", (updated_at, kind, occurrence["task_id"]))
+            c.dismiss_reminders_for_source(kind, occurrence["task_id"], updated_at)
         if occurrence["task_id"] == record_id:
             updated_current = updated
 
-    c.execute("DELETE FROM recurrence_occurrences WHERE task_id IN (%s)" % ",".join("?" for _ in scheduled), tuple(scheduled))
+    c.remove_occurrences(scheduled)
     for occurrence, _, _ in occurrences:
         task_id = occurrence["task_id"]
         if task_id in scheduled:
-            c.execute("INSERT INTO recurrence_occurrences(series_id,occurrence_date,task_id,sequence) VALUES(?,?,?,?)",
-                      (series_id, scheduled[task_id], task_id, occurrence["sequence"]))
+            c.add_occurrence(series_id, scheduled[task_id], task_id, occurrence["sequence"])
 
     rule_date = anchor.isoformat()
     normalized_rule[date_field] = rule_date
     normalized_rule["seriesKind"] = kind
     normalized_rule["seriesId"] = series_id
-    c.execute("UPDATE recurrence_series SET rule=?,start_date=?,anchor_sequence=?,active=?,updated_at=? WHERE series_id=?",
-              (json.dumps(normalized_rule), rule_date, anchor_sequence, 0 if repeat == "One Time" else 1, stamp(), series_id))
+    c.update_series(series_id, normalized_rule, rule_date, anchor_sequence, repeat != "One Time", stamp())
     return updated_current, audit_events
 
 def stamp():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
+def reject_constant(_name):
+    raise ValueError("Invalid number")
+
+def parse_whole_number(text):
+    value = int(text)
+    if abs(value) >= 2 ** 53:
+        raise ValueError("Number out of range")
+    return value
+
 def audit_record(c, actor, record_id, action, snapshot, details=None, created=None):
-    c.execute(
-        "INSERT INTO audit(actor,record_id,action,created,snapshot,details) VALUES(?,?,?,?,?,?)",
-        (actor, record_id, action, created or stamp(), json.dumps(snapshot), json.dumps(details or {})),
-    )
+    c.add_audit(actor, record_id, action, created or stamp(), snapshot, details)
 
 def activity_entry(row, snapshot, profiles, viewer, record_kind=""):
-    details = json.loads(row["details"] or "{}")
+    details = row["details"] or {}
     before = details.get("before")
     if before and (not visible(before, viewer) or viewer == "Daughter" and before.get("visibility") != "Family"):
         details = {}
@@ -1285,8 +1245,8 @@ def activity_entry(row, snapshot, profiles, viewer, record_kind=""):
 
 def chore_completion_metrics(c):
     completions = []
-    for row in c.execute("SELECT body FROM records WHERE kind='tasks' AND deleted=0"):
-        task = json.loads(row["body"])
+    for row in c.list_records(kind="tasks"):
+        task = row["body"]
         if not qualifies_as_chore(task) or not visible(task, "Daughter"):
             continue
         history = task.get("completionHistory", [])
@@ -1342,24 +1302,38 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         hashed = hashlib.sha256(token.value.encode()).hexdigest()
-        row = c.execute("SELECT name FROM sessions WHERE token=? AND expires>?", (hashed, time.time())).fetchone()
-        return row["name"] if row else None
+        return c.session_user(hashed, time.time())
+
+    def storage_failure(self, error):
+        # Only the exception class is logged: driver messages can contain hosts, users or SQL.
+        sys.stderr.write(f"storage failure: {type(error).__name__}\n")
+        status, message = (error.status, error.public_message if isinstance(error, SchemaNotReady) else str(error)) if isinstance(error, StorageError) else (503, StorageError.public_message)
+        self.respond(status, {"error": message})
 
     def do_GET(self):
+        try:
+            self.handle_get()
+        except (StorageError, ConfigError) as error:
+            self.storage_failure(error)
+
+    def handle_get(self):
         path = self.path.split("?")[0]
         if path == "/api/profiles":
-            with connection() as c:
+            with repository() as c:
                 return self.respond(200, {"profiles": profile_data(c)})
         if path == "/api/state":
-            with connection() as c:
+            with repository() as c:
                 name = self.identity(c)
                 if not name:
                     return self.respond(401, {"error": "Please sign in."})
+                c.begin_write()
                 ensure_recurrence_occurrences(c)
+                c.commit()
                 state = {k: [] for k in KINDS}
                 allowed = set()
-                for row in c.execute("SELECT * FROM records WHERE deleted=0"):
-                    record = json.loads(row["body"])
+                seen_recognitions = c.seen_recognitions(name) if name == "Daughter" else {}
+                for row in c.list_records():
+                    record = row["body"]
                     record["id"] = row["id"]
                     if record.get("archived") and (row["kind"] == "events" and record.get("sourceDanceId") or row["kind"] == "dance" and not adult(name)):
                         continue
@@ -1371,31 +1345,31 @@ class Handler(BaseHTTPRequestHandler):
                         if row["kind"] == "tasks":
                             record["chore"] = qualifies_as_chore(record)
                         if row["kind"] == "recognitions" and name == "Daughter":
-                            receipt = c.execute("SELECT seen_at FROM recognition_receipts WHERE recognition_id=? AND recipient=?", (row["id"], name)).fetchone()
-                            record["seenAt"] = receipt["seen_at"] if receipt else ""
+                            record["seenAt"] = seen_recognitions.get(row["id"], "")
                         state[row["kind"]].append(record)
                         allowed.add(row["id"])
                 profiles = profile_data(c)
                 activity = []
-                for event in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 500"):
-                    snapshot = json.loads(event["snapshot"] or "{}")
-                    record_row = c.execute("SELECT kind,body FROM records WHERE id=?", (event["record_id"],)).fetchone() if event["record_id"] else None
-                    if not snapshot and event["record_id"]:
-                        if record_row:
-                            snapshot = json.loads(record_row["body"])
+                for event in c.list_audit_feed(500):
+                    snapshot = event["snapshot"]
+                    if not snapshot and event["record_body"] is not None:
+                        snapshot = event["record_body"]
                     if not snapshot or not visible(snapshot, name):
                         continue
                     if name == "Daughter" and event["action"] in {"archive", "restore"} and snapshot.get("danceType"):
                         continue
-                    activity.append(activity_entry(event, snapshot, profiles, name, record_row["kind"] if record_row else ""))
+                    activity.append(activity_entry(event, snapshot, profiles, name, event["record_kind"] or ""))
                     if len(activity) == 50:
                         break
                 state["activity"] = activity
                 state.update(viewer=name, profiles=profiles, **chore_completion_metrics(c))
                 state["familyMembers"] = family_member_data(c, profiles)
                 state["timezone"] = HUB_TIMEZONE
-                generate_reminders(c, profiles)
-                generate_notification_reminders(c, profiles)
+                c.begin_write()
+                known = c.reminder_keys()
+                generate_reminders(c, profiles, known=known)
+                generate_notification_reminders(c, profiles, known=known)
+                c.commit()
                 state["reminders"] = reminder_state(c, name, state)
                 state["danceAttention"] = dance_attention_items(name, state)
                 state["badgeCounts"] = notification_badge_counts(name, state)
@@ -1415,6 +1389,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        try:
+            self.handle_post()
+        except (StorageError, ConfigError) as error:
+            self.storage_failure(error)
+
+    def handle_post(self):
         # Custom header forces cross-origin callers to preflight; no CORS is enabled.
         if self.headers.get("X-Hub-Request") != "1":
             return self.respond(403, {"error": "Invalid request origin"})
@@ -1425,32 +1405,35 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 32768:
                 raise ValueError("Request is too large or empty")
-            payload = json.loads(self.rfile.read(length))
+            raw = self.rfile.read(length)
+            if b"\\u0000" in raw:
+                raise ValueError("Invalid text")  # PostgreSQL JSONB cannot store NUL; reject on every backend
+            payload = json.loads(raw, parse_constant=reject_constant, parse_int=parse_whole_number)
             if not isinstance(payload, dict):
                 raise ValueError("Expected an object")
-            with connection() as c:
+            with repository() as c:
                 name = self.identity(c)
                 if self.path == "/api/login":
                     if not isinstance(payload.get("name"), str) or payload["name"] not in {"Dad", "Mom", "Daughter"} or not isinstance(payload.get("password"), str) or len(payload["password"]) > 1024:
                         raise ValueError("Invalid sign-in details")
                     address = self.client_address[0]
                     now = int(time.time())
-                    attempt = c.execute("SELECT * FROM attempts WHERE address=?", (address,)).fetchone()
+                    attempt = c.get_attempt(address)
                     if attempt and attempt["reset"] > now and attempt["count"] >= 10:
                         return self.respond(429, {"error": "Too many attempts. Try again in 15 minutes."})
-                    user = c.execute("SELECT * FROM users WHERE name=?", (payload.get("name"),)).fetchone()
+                    user = c.get_user_credentials(payload.get("name"))
                     salt = user["salt"] if user else "00" * 16
                     valid = hmac.compare_digest(password_hash(str(payload.get("password", "")), salt), user["hash"] if user else "00" * 64)
                     if not user or not valid:
                         count = attempt["count"] + 1 if attempt and attempt["reset"] > now else 1
                         reset = attempt["reset"] if attempt and attempt["reset"] > now else now + 900
-                        c.execute("INSERT OR REPLACE INTO attempts VALUES(?,?,?)", (address, count, reset))
+                        c.save_attempt(address, count, reset)
                         c.commit()
                         return self.respond(401, {"error": "Incorrect name or password"})
-                    c.execute("DELETE FROM attempts WHERE address=?", (address,))
-                    c.execute("DELETE FROM sessions WHERE expires<?", (now,))
+                    c.clear_attempt(address)
+                    c.delete_expired_sessions(now)
                     token = secrets.token_urlsafe(32)
-                    c.execute("INSERT INTO sessions VALUES(?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), user["name"], now + 604800))
+                    c.create_session(hashlib.sha256(token.encode()).hexdigest(), user["name"], now + 604800)
                     secure = "; Secure" if os.environ.get("HUB_SECURE_COOKIE") == "1" else ""
                     c.commit()
                     return self.respond(200, {"ok": True}, f"hub_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800{secure}")
@@ -1458,7 +1441,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.respond(401, {"error": "Please sign in."})
                 if self.path == "/api/logout":
                     cookie = SimpleCookie(self.headers.get("Cookie", ""))
-                    c.execute("DELETE FROM sessions WHERE token=?", (hashlib.sha256(cookie["hub_session"].value.encode()).hexdigest(),))
+                    c.delete_session(hashlib.sha256(cookie["hub_session"].value.encode()).hexdigest())
                     c.commit()
                     return self.respond(200, {"ok": True}, "hub_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 if self.path == "/api/reminders/action":
@@ -1475,44 +1458,43 @@ class Handler(BaseHTTPRequestHandler):
                         types = category_types.get(category)
                         if not types:
                             raise ValueError("Invalid reminder category")
-                        placeholders = ",".join("?" for _ in types)
-                        c.execute(f"UPDATE reminders SET read_at=COALESCE(read_at,?) WHERE account=? AND dismissed_at IS NULL AND read_at IS NULL AND reminder_type IN ({placeholders})",
-                                  (stamp(), name, *types))
+                        c.mark_reminders_read(name, types, stamp())
                         c.commit()
                         return self.respond(200, {"ok": True})
                     reminder_id = payload.get("id")
                     if type(reminder_id) is not int:
                         raise ValueError("Invalid reminder ID")
-                    reminder = c.execute("SELECT * FROM reminders WHERE id=? AND account=?", (reminder_id, name)).fetchone()
+                    reminder = c.get_reminder(reminder_id, name)
                     if not reminder:
                         return self.respond(404, {"error": "Reminder unavailable"})
                     if reminder["source_kind"] == "recap":
                         if payload.get("action") not in {"read", "dismiss"}:
                             raise ValueError("Unknown recap reminder action")
-                        now = stamp()
-                        c.execute("UPDATE reminders SET read_at=COALESCE(read_at,?),dismissed_at=CASE WHEN ?='dismiss' THEN COALESCE(dismissed_at,?) ELSE dismissed_at END WHERE id=? AND account=?",
-                                  (now, payload["action"], now, reminder_id, name))
+                        if payload["action"] == "dismiss":
+                            c.dismiss_reminder(reminder_id, name, stamp())
+                        else:
+                            c.mark_reminder_read(reminder_id, name, stamp())
                         c.commit()
                         return self.respond(200, {"ok": True})
-                    record_row = c.execute("SELECT * FROM records WHERE id=? AND kind=? AND deleted=0", (reminder["source_id"], reminder["source_kind"])).fetchone()
-                    if not record_row:
+                    record_row = c.get_record(reminder["source_id"])
+                    if not record_row or record_row["kind"] != reminder["source_kind"]:
                         return self.respond(404, {"error": "Reminder source unavailable"})
-                    source = json.loads(record_row["body"])
+                    source = record_row["body"]
                     if not visible(source, name):
                         return self.respond(404, {"error": "Reminder unavailable"})
                     action = payload.get("action")
                     now = stamp()
                     if action == "read":
-                        c.execute("UPDATE reminders SET read_at=COALESCE(read_at,?) WHERE id=? AND account=?", (now, reminder_id, name))
+                        c.mark_reminder_read(reminder_id, name, now)
                     elif action == "dismiss":
-                        c.execute("UPDATE reminders SET read_at=COALESCE(read_at,?),dismissed_at=COALESCE(dismissed_at,?) WHERE id=? AND account=?", (now, now, reminder_id, name))
+                        c.dismiss_reminder(reminder_id, name, now)
                         audit_record(c, name, reminder["source_id"], "reminder_dismissed", {**source, "id": reminder["source_id"]}, {"reminderType": reminder["reminder_type"]})
                     elif action == "snooze":
                         minutes = payload.get("minutes")
                         if minutes not in {15, 30, 60, 120, 1440}:
                             raise ValueError("Choose a supported snooze interval")
                         until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)).isoformat()
-                        c.execute("UPDATE reminders SET read_at=COALESCE(read_at,?),snoozed_until=? WHERE id=? AND account=?", (now, until, reminder_id, name))
+                        c.snooze_reminder(reminder_id, name, until, now)
                         audit_record(c, name, reminder["source_id"], "reminder_snoozed", {**source, "id": reminder["source_id"]}, {"reminderType": reminder["reminder_type"], "snoozedUntil": until})
                     else:
                         raise ValueError("Unknown reminder action")
@@ -1524,19 +1506,18 @@ class Handler(BaseHTTPRequestHandler):
                     recognition_id = payload.get("id")
                     if type(recognition_id) is not int or payload.get("action") != "seen":
                         raise ValueError("Invalid recognition action")
-                    row = c.execute("SELECT body FROM records WHERE id=? AND kind='recognitions' AND deleted=0", (recognition_id,)).fetchone()
-                    if not row:
+                    row = c.get_record(recognition_id)
+                    if not row or row["kind"] != "recognitions":
                         return self.respond(404, {"error": "Recognition unavailable"})
-                    recognition = json.loads(row["body"])
+                    recognition = row["body"]
                     if recognition.get("who") != name or not visible(recognition, name):
                         return self.respond(404, {"error": "Recognition unavailable"})
-                    c.execute("INSERT OR IGNORE INTO recognition_receipts(recognition_id,recipient,seen_at) VALUES(?,?,?)",
-                              (recognition_id, name, stamp()))
+                    c.mark_recognition_seen(recognition_id, name, stamp())
                     c.commit()
                     return self.respond(200, {"ok": True})
                 if self.path != "/api/action":
                     return self.respond(404, {"error": "Not found"})
-                c.execute("BEGIN IMMEDIATE")
+                c.begin_write()
                 action = payload.get("action")
                 event_details = {}
                 extra_audit_events = []
@@ -1639,17 +1620,16 @@ class Handler(BaseHTTPRequestHandler):
                         if source_task_id is not None:
                             if type(source_task_id) is not int:
                                 raise ValueError("Invalid recognition task")
-                            source = c.execute("SELECT body,deleted FROM records WHERE id=? AND kind='tasks'", (source_task_id,)).fetchone()
-                            if not source or source["deleted"]:
+                            source = c.get_record(source_task_id)
+                            if not source or source["kind"] != "tasks":
                                 raise ValueError("Completed task unavailable")
-                            source_task = json.loads(source["body"])
+                            source_task = source["body"]
                             if not visible(source_task, name) or source_task.get("status") != "done" or source_task.get("completedBy") != "Daughter":
                                 raise ValueError("Recognition must be linked to Arielle's completed work")
                         r.update(title=recognition_type, text=message, who="Daughter", visibility="Family")
                     if kind in {"lists", "dance"}:
                         r["checked"] = False
-                    cursor = c.execute("INSERT INTO records(kind,body) VALUES(?,?)", (kind, json.dumps(r)))
-                    rid = cursor.lastrowid
+                    rid = c.create_record(kind, r)
                     if kind == "dance" and r.get("danceType") == "competition":
                         sync_competition_calendar(c, name, rid, r)
                     if kind == "activities":
@@ -1662,19 +1642,17 @@ class Handler(BaseHTTPRequestHandler):
                         series_rule = dict(r)
                         if kind == "tasks":
                             series_rule["seriesKind"] = "tasks"
-                        c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(r), rid))
-                        c.execute("INSERT INTO recurrence_series(series_id,rule,start_date,created_at,updated_at,created_by) VALUES(?,?,?,?,?,?)",
-                                  (rid, json.dumps(series_rule), start_date, created_at, created_at, name))
-                        c.execute("INSERT INTO recurrence_occurrences(series_id,occurrence_date,task_id,sequence) VALUES(?,?,?,0)",
-                                  (rid, start_date, rid))
+                        c.update_record_body(rid, r)
+                        c.create_series(rid, series_rule, start_date, created_at, created_at, name)
+                        c.add_occurrence(rid, start_date, rid, 0)
                         recurring_series_created = True
                         ensure_recurrence_occurrences(c)
                 elif action == "archive_season":
                     if not adult(name):
                         return self.respond(403, {"error": "Only parents can archive a Dance season"})
                     count = 0
-                    for season_row in c.execute("SELECT id,body FROM records WHERE kind='dance' AND deleted=0").fetchall():
-                        season_record = json.loads(season_row["body"])
+                    for season_row in c.list_records(kind="dance"):
+                        season_record = season_row["body"]
                         if season_record.get("danceType") and not season_record.get("archived"):
                             count += set_dance_archived(c, name, season_row["id"], season_record, True)
                     c.commit()
@@ -1682,10 +1660,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     if type(payload.get("id")) is not int:
                         raise ValueError("Invalid item ID")
-                    row = c.execute("SELECT * FROM records WHERE id=? AND deleted=0", (payload["id"],)).fetchone()
-                    if not row or not visible(json.loads(row["body"]), name):
+                    row = c.get_record(payload["id"])
+                    if not row or not visible(row["body"], name):
                         return self.respond(404, {"error": "Item unavailable"})
-                    rid, kind, r = row["id"], row["kind"], json.loads(row["body"])
+                    rid, kind, r = row["id"], row["kind"], row["body"]
                     previous = dict(r)
                     if kind == "events" and r.get("sourceDanceId") and action in {"edit", "delete"}:
                         return self.respond(403, {"error": "Edit or delete the source competition to keep its calendar dates in sync"})
@@ -1707,37 +1685,33 @@ class Handler(BaseHTTPRequestHandler):
                         deleted_at = stamp()
                         series_id = r.get("seriesId")
                         scope = payload.get("scope", "this")
-                        series = c.execute("SELECT * FROM recurrence_series WHERE series_id=? AND active=1", (series_id,)).fetchone() if series_id else None
+                        series = c.get_series(series_id) if series_id else None
                         if series and scope not in {"this", "future", "series"}:
                             raise ValueError("Choose this occurrence, this and future, or entire series")
                         targets = [(rid, r)]
                         if series and scope != "this":
-                            occurrence = c.execute("SELECT sequence FROM recurrence_occurrences WHERE series_id=? AND task_id=?", (series_id, rid)).fetchone()
+                            occurrence = c.get_occurrence(series_id, rid)
                             if not occurrence:
                                 raise ValueError("Recurring occurrence index is unavailable")
-                            if scope == "future":
-                                rows = c.execute("SELECT r.id,r.body FROM recurrence_occurrences o JOIN records r ON r.id=o.task_id WHERE o.series_id=? AND o.sequence>=? AND r.deleted=0", (series_id, occurrence["sequence"])).fetchall()
-                            else:
-                                rows = c.execute("SELECT r.id,r.body FROM recurrence_occurrences o JOIN records r ON r.id=o.task_id WHERE o.series_id=? AND r.deleted=0", (series_id,)).fetchall()
-                            targets = [(item["id"], json.loads(item["body"])) for item in rows if json.loads(item["body"]).get("status") not in {"done", "missed"}]
-                            c.execute("UPDATE recurrence_series SET active=0,updated_at=? WHERE series_id=?", (deleted_at, series_id))
+                            members = c.list_series_members(series_id, occurrence["sequence"] if scope == "future" else None)
+                            targets = [(item["task_id"], item["body"]) for item in members if not item["deleted"] and item["body"].get("status") not in {"done", "missed"}]
+                            c.deactivate_series(series_id, deleted_at)
                         for target_id, target in targets:
                             target.update(deletedAt=deleted_at, deletedBy=name, updatedAt=deleted_at, updatedBy=name)
-                            c.execute("UPDATE records SET body=?, deleted=1 WHERE id=?", (json.dumps(target), target_id))
-                            c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind=? AND source_id=?", (deleted_at, kind, target_id))
+                            c.soft_delete_record(target_id, target)
+                            c.dismiss_reminders_for_source(kind, target_id, deleted_at)
                             audit_record(c, name, target_id, "delete", {**target, "id": target_id}, {"scope": scope})
                             if kind == "dance" and target.get("danceType"):
                                 for event_id, event in dance_calendar_mirrors(c, target_id):
                                     event.update(deletedAt=deleted_at, deletedBy=name, updatedAt=deleted_at, updatedBy=name)
-                                    c.execute("UPDATE records SET body=?,deleted=1 WHERE id=?", (json.dumps(event), event_id))
-                                    c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (deleted_at, event_id))
+                                    c.soft_delete_record(event_id, event)
+                                    c.dismiss_reminders_for_source("events", event_id, deleted_at)
                                     audit_record(c, name, event_id, "delete", {**event, "id": event_id}, {"sourceDanceId": target_id})
                                 unlink_dance_references(c, name, target_id, target.get("danceType"), deleted_at)
                             if kind == "activities":
-                                for linked_event in c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0").fetchall():
-                                    if json.loads(linked_event["body"]).get("sourceActivityId") == target_id:
-                                        c.execute("UPDATE records SET deleted=1 WHERE id=?", (linked_event["id"],))
-                                        c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (deleted_at, linked_event["id"]))
+                                for linked_event in c.find_by_source("sourceActivityId", target_id):
+                                    c.soft_delete_record(linked_event["id"])
+                                    c.dismiss_reminders_for_source("events", linked_event["id"], deleted_at)
                         if series and scope == "this":
                             audit_record(c, name, rid, "recurrence_occurrence_deleted", {**r, "id": rid}, {"scope": scope})
                         c.commit()
@@ -1757,7 +1731,7 @@ class Handler(BaseHTTPRequestHandler):
                                     event_details["before"][field] = r.get(field)
                                     event_details["after"][field] = updated.get(field)
                             updated.update(updatedAt=stamp(), updatedBy=name)
-                            c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(updated), rid))
+                            c.update_record_body(rid, updated)
                             r = updated
                             if r.get("danceType") == "competition":
                                 sync_competition_calendar(c, name, rid, r)
@@ -1776,8 +1750,7 @@ class Handler(BaseHTTPRequestHandler):
                                     event_details["after"][field] = updated.get(field)
                             updated.update(updatedAt=stamp(), updatedBy=name)
                             if {"date", "reminderDate", "reminderOffsets"} & set(event_details["after"]):
-                                c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='notes' AND source_id=?",
-                                          (updated["updatedAt"], rid))
+                                c.dismiss_reminders_for_source("notes", rid, updated["updatedAt"])
                             r = updated
                             action = "edit"
                         elif kind == "activities":
@@ -1885,10 +1858,10 @@ class Handler(BaseHTTPRequestHandler):
                         r.update(updatedAt=completed_at, updatedBy=name)
                         event_details = {"deadlineId": deadline_id, "completedAt": completed_at}
                         action = "deadline_completed"
-                        for linked_event in c.execute("SELECT id,body FROM records WHERE kind='events' AND deleted=0").fetchall():
-                            event = json.loads(linked_event["body"])
-                            if event.get("sourceDanceId") == rid and event.get("sourceDanceKey") == "deadline:" + deadline_id:
-                                c.execute("UPDATE reminders SET dismissed_at=COALESCE(dismissed_at,?) WHERE source_kind='events' AND source_id=?", (completed_at, linked_event["id"]))
+                        for linked_event in c.find_by_source("sourceDanceId", rid):
+                            event = linked_event["body"]
+                            if event.get("sourceDanceKey") == "deadline:" + deadline_id:
+                                c.dismiss_reminders_for_source("events", linked_event["id"], completed_at)
                     elif action == "decision":
                         if kind != "requests" or not adult(name):
                             return self.respond(403, {"error": "Only parents can decide requests"})
@@ -1905,7 +1878,7 @@ class Handler(BaseHTTPRequestHandler):
                             event_date = r.get("date") or r.get("requestedDate") or r.get("dueDate")
                             if event_date:
                                 event_title = r.get("title") or r.get("text") or "Request"
-                                existing = [json.loads(row["body"]) for row in c.execute("SELECT body FROM records WHERE kind='events' AND deleted=0").fetchall()]
+                                existing = [row["body"] for row in c.find_by_source("sourceRequestId", rid)]
                                 already = any(item.get("title") == event_title and item.get("date") == event_date and item.get("sourceRequestId") == rid for item in existing)
                                 if not already:
                                     event = {
@@ -1931,8 +1904,8 @@ class Handler(BaseHTTPRequestHandler):
                                     }
                                     event = event_fields(event, name)
                                     event.update(creator=name, by=name, createdAt=stamp(), updatedAt=stamp(), sourceRequestId=rid)
-                                    event_cursor = c.execute("INSERT INTO records(kind,body) VALUES(?,?)", ("events", json.dumps(event)))
-                                    audit_record(c, name, event_cursor.lastrowid, "create", {**event, "id": event_cursor.lastrowid})
+                                    event_id = c.create_record("events", event)
+                                    audit_record(c, name, event_id, "create", {**event, "id": event_id})
                     elif action == "reply":
                         if kind != "requests" or name != r.get("creator") and not adult(name):
                             return self.respond(403, {"error": "Only the requester or a parent can reply"})
@@ -2013,15 +1986,15 @@ class Handler(BaseHTTPRequestHandler):
                     if kind == "dance" and action == "checklist_item":
                         r["updatedAt"] = stamp()
                         r["updatedBy"] = name
-                    c.execute("UPDATE records SET body=? WHERE id=?", (json.dumps(r), rid))
+                    c.update_record_body(rid, r)
                 snapshot = {**r, "id": rid}
                 audit_record(c, name, rid, action, snapshot, event_details)
                 for target_id, audit_action, details in extra_audit_events:
                     if target_id == rid and audit_action == "edit":
                         continue
-                    target_row = c.execute("SELECT body FROM records WHERE id=?", (target_id,)).fetchone()
+                    target_row = c.get_record(target_id, include_deleted=True)
                     if target_row:
-                        audit_record(c, name, target_id, audit_action, {**json.loads(target_row["body"]), "id": target_id}, details)
+                        audit_record(c, name, target_id, audit_action, {**target_row["body"], "id": target_id}, details)
                 if recurring_series_created:
                     audit_record(c, name, rid, "recurring_series_created", snapshot,
                                  {"repeat": r.get("repeat"), "startDate": r.get("occurrenceDate")})
@@ -2040,7 +2013,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--user", choices=["Dad", "Mom", "Daughter"], help="Create/reset a family account interactively")
     args = parser.parse_args()
-    initialize()
+    try:
+        initialize()
+    except (StorageError, ConfigError) as error:
+        raise SystemExit(f"error: {error}")
     if args.user:
         import getpass
         password = getpass.getpass("New password (at least 12 characters): ")
@@ -2049,9 +2025,9 @@ if __name__ == "__main__":
         if password != getpass.getpass("Confirm password: "):
             raise SystemExit("Passwords do not match")
         salt = secrets.token_hex(16)
-        with connection() as c:
-            c.execute("INSERT INTO users(name,salt,hash,display_name) VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET salt=excluded.salt, hash=excluded.hash", (args.user, salt, password_hash(password, salt), DEFAULT_DISPLAY_NAMES[args.user]))
-            c.execute("DELETE FROM sessions WHERE name=?", (args.user,))
+        with repository() as c:
+            c.save_user_credentials(args.user, salt, password_hash(password, salt), DEFAULT_DISPLAY_NAMES[args.user])
+            c.delete_sessions_for(args.user)
         print("Account saved; previous sessions revoked.")
     else:
         ThreadingHTTPServer((os.environ.get("HUB_HOST", "127.0.0.1"), int(os.environ.get("PORT", "8080"))), Handler).serve_forever()

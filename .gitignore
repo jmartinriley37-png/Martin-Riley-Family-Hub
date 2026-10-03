@@ -4,3 +4,10 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+*.dump
+*.backup
+*.sql.gz
+.pgpass
+*.pem
+*.key
