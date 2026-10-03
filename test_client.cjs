@@ -218,6 +218,16 @@ const restoreBusyButton=vm.runInContext('pendingButton()',context);
 assert.ok(busyButton.disabled&&busyButton.attributes['aria-busy']==='true');
 restoreBusyButton();
 assert.ok(!busyButton.disabled&&!busyButton.attributes['aria-busy']);
+app.dataset={};app.insertAdjacentHTML=(_position,html)=>{app.modal+=html};app.remove=()=>{app.modal=app.modal.replace(/<div class=actions>.*?<\/div>/s,'')};
+vm.runInContext("S.viewer='Dad';S.activities=[{id:301,memberId:'Maddox',activityName:'Baseball Practice',activityType:'Baseball',eventType:'Practice',date:S.prepDate,visibility:'Family'}];S.events=[{id:302,title:'Maddox · Baseball',date:S.prepDate,visibility:'Family',creator:'Dad',sourceActivityId:301},{id:303,title:'Plain dinner',date:S.prepDate,visibility:'Family',creator:'Dad'}];openEventDetails(302)",context);
+assert.ok(app.modal.includes('Edit Maddox activity')&&app.modal.includes('manages its calendar event')&&!app.modal.includes('Edit / Reschedule'));
+vm.runInContext("openEventForm(302)",context);
+assert.ok(app.modal.includes('Edit Maddox activity'));
+vm.runInContext("S.viewer='Daughter';openEventDetails(302)",context);
+assert.ok(app.modal.includes('Managed by an Activity')&&!app.modal.includes('Edit / Reschedule')&&!app.modal.includes('Delete'));
+vm.runInContext("S.viewer='Dad';openEventDetails(303)",context);
+assert.ok(app.modal.includes('Plain dinner')&&app.modal.includes('Edit / Reschedule')&&app.modal.includes('Delete')&&!app.modal.includes('Managed by'));
+delete app.dataset;delete app.insertAdjacentHTML;delete app.remove;
 console.log('PASS: all screens render for three roles; user HTML is escaped.');
 
 async function verifyQueuedForcedRefresh(){

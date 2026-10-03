@@ -190,6 +190,12 @@ def validate(dataset):
     for row in dataset["recurrence_series"]:
         if row["series_id"] not in records:
             issues.append(Issue("error", "orphan_series", "Recurrence series has no record", "recurrence_series", row["series_id"]))
+    owners = {row["task_id"]: row["series_id"] for row in dataset["recurrence_occurrences"]}
+    for row in dataset["recurrence_series"]:
+        if owners.get(row["series_id"], row["series_id"]) != row["series_id"]:
+            issues.append(Issue("warning", "series_from_generated_occurrence",
+                                "A generated occurrence was turned into its own series (older restart defect); review recurring items before relying on them",
+                                "recurrence_series", row["series_id"]))
     for row in dataset["recurrence_occurrences"]:
         key = [row["series_id"], row["occurrence_date"]]
         if row["series_id"] not in series_ids:
@@ -212,7 +218,7 @@ def validate(dataset):
         else:
             issues.append(Issue("error", "unknown_member_type", f"Unknown member type {row['member_type']!r}", "family_members", member_id))
         for manager in _id_list(row["managed_by"]):
-            if manager not in members:
+            if manager not in members and manager not in users:  # accounts are valid managers even before their profile row exists
                 issues.append(Issue("error", "orphan_managed_by", f"Managed-by {manager!r} is not a family member", "family_members", member_id))
 
     for rid, row in records.items():

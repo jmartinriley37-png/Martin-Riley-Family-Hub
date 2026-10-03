@@ -503,6 +503,13 @@ class ImporterDryRunTests(unittest.TestCase):
                               "orphan_occurrence_series", "orphan_occurrence_record"}, self.codes(report))
         self.assertEqual(report["summary"]["counts"]["reminders"], 4)
 
+    def test_series_created_from_a_generated_occurrence_is_flagged(self):
+        def damage(c, ids):
+            c.execute("INSERT INTO recurrence_series(series_id,rule,start_date,created_at,updated_at) VALUES(?,'{}','2030-01-13','a','b')", (ids["series_next"],))
+        report, _ = self.dry(damage)
+        self.assertIn("series_from_generated_occurrence", self.codes(report, "warnings"))
+        self.assertTrue(report["ready"])
+
     def test_generated_calendar_events_must_have_exactly_one_valid_source(self):
         def corrupt(c, ids):
             c.execute("UPDATE records SET body=json_set(body,'$.sourceDanceId',987654) WHERE id=?", (ids["mirror_start"],))
@@ -569,28 +576,28 @@ class CommandLineSafetyTests(unittest.TestCase):
 
     def test_default_is_dry_run_and_needs_no_destination(self):
         with sqlite_source() as (path, _):
-            code, out, _ = self.run_cli("import", "--source", str(path), "--json")
+            code, out, _ = self.run_cli("import-dry-run", "--source", str(path), "--json")
         self.assertEqual(code, 0)
         self.assertIn('"wrote_to_destination": false', out)
 
     def test_dry_run_reports_failure_with_exit_code_two(self):
         with sqlite_source(lambda c, ids: c.execute("UPDATE records SET kind='mystery' WHERE id=1")) as (path, _):
-            self.assertEqual(self.run_cli("import", "--source", str(path))[0], 2)
+            self.assertEqual(self.run_cli("import-dry-run", "--source", str(path))[0], 2)
 
     def test_execute_requires_confirmation_and_destination(self):
         with sqlite_source() as (path, _):
-            self.assertEqual(self.run_cli("import", "--source", str(path), "--execute")[0], 1)
-            self.assertEqual(self.run_cli("import", "--source", str(path), "--execute", "--confirm-write")[0], 1)
+            self.assertEqual(self.run_cli("import-execute", "--source", str(path), "--destination-env", "X")[0], 1)
+            self.assertEqual(self.run_cli("import-execute", "--source", str(path), "--destination-env", "X", "--confirm-write")[0], 1)
 
     def test_live_database_path_is_refused_without_explicit_flag(self):
-        code, _, err = self.run_cli("import", "--source", str(config.DEFAULT_SQLITE_PATH))
+        code, _, err = self.run_cli("import-dry-run", "--source", str(config.DEFAULT_SQLITE_PATH))
         self.assertEqual(code, 1)
         self.assertIn("allow-live-source", err)
 
     def test_source_is_required_and_must_exist(self):
         with self.assertRaises(SystemExit):
-            self.run_cli("import")
-        self.assertEqual(self.run_cli("import", "--source", "/nonexistent/path.sqlite3")[0], 1)
+            self.run_cli("import-dry-run")
+        self.assertEqual(self.run_cli("import-dry-run", "--source", "/nonexistent/path.sqlite3")[0], 1)
 
     def test_connection_errors_do_not_leak_the_url(self):
         secret = "leakcheck-pw"
@@ -779,14 +786,20 @@ class PostgresImportTests(PostgresCase):
         for table in importer.TABLES:
             self.assertEqual(self.count(table), 0, table)
 
+    def database_name(self):
+        return self.conn.execute("SELECT current_database()").fetchone()[0]
+
     def test_cli_execute_requires_confirmation_then_imports(self):
         with sqlite_source() as (path, _), mock.patch.dict(os.environ, {"TEST_DEST_URL": self.url}):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                self.assertEqual(cli.main(["import", "--source", str(path), "--destination-env", "TEST_DEST_URL", "--execute"]), 1)
+                self.assertEqual(cli.main(["import-execute", "--source", str(path), "--destination-env", "TEST_DEST_URL", "--confirm-write"]), 1)
+                self.assertEqual(cli.main(["import-execute", "--source", str(path), "--destination-env", "TEST_DEST_URL",
+                                           "--confirm-write", "--confirm-database", "wrong-name"]), 1)
             self.assertEqual(self.count("records"), 0)
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(cli.main(["import", "--source", str(path), "--destination-env", "TEST_DEST_URL", "--execute", "--confirm-write"]), 0)
+                self.assertEqual(cli.main(["import-execute", "--source", str(path), "--destination-env", "TEST_DEST_URL",
+                                           "--confirm-write", "--confirm-database", self.database_name()]), 0)
             self.assertGreater(self.count("records"), 0)
 
 

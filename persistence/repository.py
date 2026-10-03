@@ -7,7 +7,7 @@ connection handling, JSON/boolean conversion and a few fragments.
 import json
 import sqlite3
 
-from .errors import StorageConflict, StorageError, StorageInvalid
+from .errors import SchemaNotReady, StorageConflict, StorageError, StorageInvalid
 
 SOURCE_FIELDS = {"sourceDanceId", "sourceActivityId", "sourceRequestId", "seriesId"}
 WRITE_LOCK_KEY = 7_419_052_002  # serialises read-modify-write requests on PostgreSQL (SQLite uses BEGIN IMMEDIATE)
@@ -44,8 +44,10 @@ class Repository:
     text_order = ""  # collation used when ordering/comparing ISO timestamp text
     driver_errors = ()
 
-    def __init__(self, conn):
+    def __init__(self, conn, release=None):
         self.conn = conn
+        self._release = release  # returns a pooled connection instead of closing it
+        self._closed = False
 
     # dialect hooks
     def _run(self, sql, params=()):
@@ -86,10 +88,21 @@ class Repository:
             pass
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         try:
-            self.conn.close()
+            if self._release:
+                self.rollback()  # no-op after commit; discards anything left open by a caller that never committed
+                self._release(self.conn)
+            else:
+                self.conn.close()
         except self.driver_errors:
             pass
+
+    def check_schema(self):
+        """Raise SchemaNotReady unless the database has the schema this code needs."""
+        raise NotImplementedError
 
     def __enter__(self):
         return self
@@ -382,8 +395,8 @@ class SQLiteRepository(Repository):
     source_field_sql = "json_extract(body,'$.{field}')"
     driver_errors = (sqlite3.Error,)
 
-    def __init__(self, conn):
-        super().__init__(conn)
+    def __init__(self, conn, release=None):
+        super().__init__(conn, release)
         conn.row_factory = sqlite3.Row
 
     def _run(self, sql, params=()):
@@ -409,6 +422,10 @@ class SQLiteRepository(Repository):
         if not self.conn.in_transaction:
             self._rows("BEGIN IMMEDIATE")
 
+    def check_schema(self):
+        if not self._rows("SELECT name FROM sqlite_master WHERE type='table' AND name='records'"):
+            raise SchemaNotReady("The SQLite database has not been initialised.")
+
     def ensure_schema(self):
         """Create/upgrade the SQLite file. PostgreSQL schema is managed only by explicit migrations."""
         try:
@@ -424,13 +441,22 @@ class PostgresRepository(Repository):
     source_field_sql = "body->>'{field}'"
     text_order = ' COLLATE "C"'  # byte-order comparison, identical to SQLite for ISO timestamps
 
-    def __init__(self, conn):
+    def __init__(self, conn, release=None):
         import psycopg
         from psycopg.rows import dict_row
         self.driver_errors = (psycopg.Error,)
         self._psycopg = psycopg
         conn.row_factory = dict_row
-        super().__init__(conn)
+        super().__init__(conn, release)
+
+    def check_schema(self):
+        from . import migrator
+        try:
+            migrator.check_ready(self.conn)
+        except self.driver_errors:
+            raise StorageError() from None
+        finally:
+            self.rollback()
 
     def _run(self, sql, params=()):
         cursor = self.conn.execute(sql.replace("%", "%%").replace("?", "%s"), tuple(params))

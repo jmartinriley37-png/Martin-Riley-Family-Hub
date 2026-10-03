@@ -91,6 +91,8 @@ def start_backend(backend, directory, migrate=True):
             with psycopg.connect(PG_URL, autocommit=True) as admin:
                 admin.execute(f'DROP SCHEMA {schema} CASCADE')
         cleanups.append(drop)
+        from persistence import runtime
+        cleanups.append(runtime.close_pools)  # pooled connections must close before the schema is dropped
         if migrate:
             with psycopg.connect(url, autocommit=True) as conn:
                 migrator.migrate(conn)
@@ -212,6 +214,106 @@ class FamilyPrivacyTests(unittest.TestCase):
                     self.assertEqual(c.execute("SELECT value FROM notification_settings WHERE name='audit_notification_last_id'").fetchone()[0], '1')
             finally:
                 server.DB = previous_db
+
+    def test_activity_calendar_mirrors_are_authoritative_but_other_events_stay_editable(self):
+        dad, mom, kid = self.client('Dad'), self.client('Mom'), self.client('Daughter')
+        day = lambda n: (server.local_today() + __import__('datetime').timedelta(days=n)).isoformat()
+        self.create(dad, 'activities', memberId='Maddox', activityName='Baseball', activityType='Baseball', eventType='Practice',
+                    date=day(1), startTime='17:00', endTime='18:00', location='North Field', reminderOffsets=[1440])
+        self.create(dad, 'events', title='Plain event', date=day(2))
+        self.create(dad, 'dance', danceType='competition', title='Comp', startDate=day(5), endDate=day(5))
+        self.create(kid, 'requests', type='Permission', text='Game?', date=day(3), time='18:30')
+        state = self.call(dad, 'state')[1]
+        activity, plain = state['activities'][0], next(e for e in state['events'] if e['title'] == 'Plain event')
+        request = state['requests'][0]
+        mirrors = lambda who: [e for e in self.call(who, 'state')[1]['events'] if e.get('sourceActivityId') == activity['id']]
+        mirror = mirrors(dad)[0]
+
+        # A, B, C: no direct edit or delete of the mirror, by parents or the child, with or without a scope.
+        for who in (dad, mom, kid):
+            for payload in ({'action': 'edit', 'id': mirror['id'], 'record': {'title': 'diverged', 'date': day(9)}},
+                            {'action': 'edit', 'id': mirror['id'], 'scope': 'series', 'record': {'title': 'diverged'}},
+                            {'action': 'delete', 'id': mirror['id']}, {'action': 'delete', 'id': mirror['id'], 'scope': 'series'}):
+                status, body = self.call(who, 'action', payload)
+                self.assertEqual(status, 403, payload)
+                if who is not kid:
+                    self.assertIn('source activity', body['error'])
+        self.assertEqual(mirrors(dad)[0]['title'], mirror['title'])
+        self.assertEqual(mirrors(dad)[0]['date'], mirror['date'])
+
+        # D: editing the Activity rebuilds its single mirror.
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': activity['id'], 'record': {'startTime': '16:00', 'endTime': '17:15', 'location': 'South Field'}})[0], 200)
+        updated = mirrors(dad)
+        self.assertEqual(len(updated), 1)
+        self.assertEqual((updated[0]['id'], updated[0]['startTime'], updated[0]['endTime'], updated[0]['location']), (mirror['id'], '16:00', '17:15', 'South Field'))
+
+        # F: ordinary events remain editable and deletable by parents.
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': plain['id'], 'scope': 'this', 'record': {'title': 'Plain event v2'}})[0], 200)
+        self.assertTrue(any(e['title'] == 'Plain event v2' for e in self.call(mom, 'state')[1]['events']))
+        self.assertEqual(self.call(kid, 'action', {'action': 'delete', 'id': plain['id']})[0], 403)
+
+        # G: an event created by approving a request is still an independent, editable event.
+        self.assertEqual(self.call(dad, 'action', {'action': 'decision', 'id': request['id'], 'status': 'Approved', 'addToCalendar': True})[0], 200)
+        converted = next(e for e in self.call(dad, 'state')[1]['events'] if e.get('sourceRequestId') == request['id'])
+        self.assertEqual(self.call(dad, 'action', {'action': 'edit', 'id': converted['id'], 'scope': 'this', 'record': {'title': 'Game night'}})[0], 200)
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': converted['id']})[0], 200)
+
+        # H: competition mirrors keep their own protection and message.
+        comp_mirror = next(e for e in self.call(dad, 'state')[1]['events'] if e.get('sourceDanceId'))
+        for payload in ({'action': 'edit', 'id': comp_mirror['id'], 'record': {'title': 'x'}}, {'action': 'delete', 'id': comp_mirror['id']}):
+            status, body = self.call(dad, 'action', payload)
+            self.assertEqual(status, 403)
+            self.assertIn('source competition', body['error'])
+
+        # E: the Activity lifecycle is unchanged: parents delete it with its mirror, the child cannot.
+        self.assertEqual(self.call(kid, 'action', {'action': 'delete', 'id': activity['id']})[0], 403)
+        self.assertEqual(len(mirrors(dad)), 1)
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': activity['id']})[0], 200)
+        after = self.call(dad, 'state')[1]
+        self.assertEqual((after['activities'], mirrors(dad)), ([], []))
+        self.assertEqual(self.call(dad, 'action', {'action': 'delete', 'id': mirror['id']})[0], 404)  # already gone, not a protected 403
+
+    def recurrence_snapshot(self):
+        with raw() as db:
+            return {
+                'series': db.execute('SELECT COUNT(*) FROM recurrence_series').fetchone()[0],
+                'records': sorted((row['id'], json.dumps(stored_body(row['body']), sort_keys=True)) for row in db.execute('SELECT id,body FROM records')),
+                'occurrences': sorted((row['series_id'], row['occurrence_date'], row['task_id'], row['sequence'])
+                                      for row in db.execute('SELECT * FROM recurrence_occurrences')),
+            }
+
+    def test_repeated_restarts_keep_generated_occurrences_inside_their_series(self):
+        dad = self.client('Dad')
+        today = server.local_today().isoformat()
+        self.create(dad, 'tasks', title='Restart weekly', who='Daughter', category='Home', dueDate=today, repeat='Weekly', reminderOffsets=[])
+        self.create(dad, 'events', title='Restart monthly', date=today, repeat='Monthly')
+        before = self.recurrence_snapshot()
+        self.assertEqual(before['series'], 2)
+        for restart in range(5):
+            server.initialize()
+            self.assertEqual(self.recurrence_snapshot(), before, f'restart {restart + 1}')
+            self.assertEqual(self.call(dad, 'state')[0], 200)
+            self.assertEqual(self.recurrence_snapshot(), before, f'state after restart {restart + 1}')
+        # Creating a recurring series after restarts still works and gets exactly one series of its own.
+        self.create(dad, 'tasks', title='After restarts', who='Daughter', category='Home', dueDate=today, repeat='Daily', reminderOffsets=[])
+        self.assertEqual(self.recurrence_snapshot()['series'], 3)
+        server.initialize()
+        self.assertEqual(self.recurrence_snapshot()['series'], 3)
+
+    def test_restart_never_rewrites_data_already_damaged_by_the_old_defect(self):
+        dad = self.client('Dad')
+        self.create(dad, 'tasks', title='Damaged earlier', who='Daughter', category='Home',
+                    dueDate=server.local_today().isoformat(), repeat='Weekly', reminderOffsets=[])
+        with raw() as db:
+            occurrence = db.execute('SELECT task_id FROM recurrence_occurrences WHERE sequence=1').fetchone()['task_id']
+            body = stored_body(db.execute('SELECT body FROM records WHERE id=?', (occurrence,)).fetchone()['body'])
+            db.execute('INSERT INTO recurrence_series(series_id,rule,start_date,created_at,updated_at) VALUES(?,?,?,?,?)',
+                       (occurrence, json.dumps(body), body['dueDate'], 'x', 'x'))
+        damaged = self.recurrence_snapshot()
+        self.assertEqual(damaged['series'], 2)
+        for _ in range(3):
+            server.initialize()
+        self.assertEqual(self.recurrence_snapshot(), damaged)
 
     def test_recurrence_dates_handle_weekdays_month_ends_and_leap_years(self):
         self.assertEqual(server.recurrence_date(Path('2026-10-01').name and __import__('datetime').date(2026, 10, 1), 'Weekly', 2), __import__('datetime').date(2026, 10, 15))

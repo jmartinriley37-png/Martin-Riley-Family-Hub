@@ -126,7 +126,7 @@ replicas with separate disks or put the database on a network filesystem.
 - Perform Android/iPhone installation, accessibility, and HTTPS browser acceptance
   tests on the deployed application. Polling is foreground synchronization, not push.
 
-## Persistence and PostgreSQL (Build D, phase 2)
+## Persistence and PostgreSQL (Build D)
 
 The server runs the same API and authorization logic on SQLite or PostgreSQL,
 selected by `HUB_DB_BACKEND`. User-facing behaviour is unchanged.
@@ -134,74 +134,108 @@ selected by `HUB_DB_BACKEND`. User-facing behaviour is unchanged.
 | Component | Role |
 | --- | --- |
 | `server.py` | HTTP handlers, validation and authorization (`visible`, `adult`, `dance_record_for_viewer`, ...). Contains no SQL |
-| `persistence/repository.py` (`SQLiteRepository`, `PostgresRepository`) | Every SQL statement. One shared implementation; dialects only supply connection handling, JSON/boolean conversion, `json_extract` vs `->>`, and text collation |
-| `persistence/runtime.py` | Opens the configured repository; verifies the PostgreSQL schema version |
-| `persistence/errors.py` | `StorageError`/`StorageConflict`/`StorageInvalid`/`SchemaNotReady`: messages are safe for browsers and logs |
-| `persistence/migrations/postgres/*.sql` + `migrator.py` | Versioned PostgreSQL schema |
-| `persistence/importer.py` + `python -m persistence import` | SQLite -> PostgreSQL importer (dry run by default) |
+| `persistence/repository.py` | Every SQL statement. One shared implementation; `SQLiteRepository` and `PostgresRepository` only supply connection handling, JSON/boolean conversion, `json_extract` vs `->>`, and text collation |
+| `persistence/runtime.py` | Opens the configured repository; owns the PostgreSQL connection pool; readiness check |
+| `persistence/config.py` | Environment parsing: backend, production rules, TLS, pool size. Never prints credentials |
+| `persistence/errors.py` | `StorageError` and friends: messages are safe for browsers and logs |
+| `persistence/migrations/postgres/*.sql`, `migrator.py` | Versioned PostgreSQL schema |
+| `persistence/importer.py`, `cli.py` | SQLite -> PostgreSQL importer and the `python -m persistence` tool |
 
 Authorization stays on the server; repositories only store and return data.
 SQLite-only code (schema bootstrap, `PRAGMA`, in-place upgrades of old files)
 lives in `SQLiteRepository.ensure_schema`. `BEGIN IMMEDIATE` on SQLite and a
-PostgreSQL advisory lock (`begin_write`) serialise read-modify-write requests,
-so concurrent duplicate actions are applied once on both backends.
+PostgreSQL advisory lock serialise read-modify-write requests, so concurrent
+duplicate actions are applied once on both backends.
 
-### Modes
+### Configuration
 
-- **SQLite (default):** `HUB_DB=/path/to/hub.sqlite3 python3 server.py`.
-- **PostgreSQL:** `HUB_DB_BACKEND=postgres HUB_DATABASE_URL=postgresql://... python3 server.py`
-  (placeholders in `.env.example`). The server never creates or alters PostgreSQL
-  schema: if the database is not migrated to the version this code needs it exits
-  with a clear, non-secret message (and answers `503` per request). Run
-  `python3 -m persistence migrate` first.
-- Install the driver only where PostgreSQL is used: `pip install -r requirements-postgres.txt`.
-- Database failures return a generic `503` (`409` for a write conflict, `400` for
-  data the database cannot store). Driver messages, URLs and credentials are never
-  returned or logged; only the exception class name is logged.
+Environment variables (names only; values are secrets and never belong in Git):
 
-### Migrations
+| Variable | Meaning |
+| --- | --- |
+| `HUB_ENV` | `development` (default) or `production`. Production refuses weak settings (below) |
+| `HUB_DB_BACKEND` | `sqlite` or `postgres`. **Required** when `HUB_ENV=production`. If `HUB_DATABASE_URL` is set but this is not, startup fails instead of using SQLite |
+| `HUB_DB` | SQLite file path (SQLite mode only) |
+| `HUB_DATABASE_URL` | Runtime PostgreSQL URL used by the web server |
+| `HUB_MIGRATION_DATABASE_URL` | Optional separate URL (a more privileged role) used only by `python -m persistence`. The runtime role can then be limited to reading/writing application tables |
+| `HUB_DB_SSLMODE`, `HUB_DB_SSLROOTCERT` | TLS mode and optional CA bundle path |
+| `HUB_DB_POOL_MIN` / `HUB_DB_POOL_MAX` | Pool size, default 1 / 5 (1-50) |
+| `HUB_DB_POOL_TIMEOUT`, `HUB_DB_CONNECT_TIMEOUT` | Seconds to wait for a pooled connection (default 5) / to open one (default 5) |
 
-Files in `persistence/migrations/postgres/` are named `NNNN_name.sql`, are
-applied in order, and each runs in its own transaction. Applied versions are
-recorded with a checksum in `schema_migrations`; editing an applied file, or a
-database that is ahead of the code, is an error. The application does not run
-`CREATE`/`ALTER` on PostgreSQL at startup. Add a schema change as a new file;
-never edit an applied one.
+Production startup **fails closed**: a missing, malformed or wrong-scheme URL,
+an unreachable database, bad credentials, a TLS failure, or a database that is
+unmigrated, partially migrated or newer than the code makes `server.py` exit with
+a non-secret message. It never falls back to SQLite. Redacted diagnostics show
+only the scheme and database name.
+
+Install the drivers only where PostgreSQL is used: `pip install -r requirements-postgres.txt`.
+
+#### TLS
+
+- **Production** (`HUB_ENV=production`): certificate verification is mandatory.
+  The default is `sslmode=verify-full`; `verify-ca` is also accepted. `disable`,
+  `allow`, `prefer` and `require` (including via `?sslmode=` in the URL) are
+  rejected before any connection is attempted. Use `HUB_DB_SSLROOTCERT` when the
+  provider's CA is not in the system store. Verification is never switched off
+  to make a connection work.
+- **Development**: libpq defaults (`prefer`) unless `HUB_DB_SSLMODE` is set, so a
+  local throwaway database without TLS works.
+
+#### Connection pool
+
+PostgreSQL connections come from one small bounded pool per process
+(`psycopg_pool`): size limits, a wait timeout that becomes a generic `503`,
+health validation on every checkout (stale or killed connections are replaced),
+rollback of any open transaction when a connection is returned, and a clean
+close at shutdown. SQLite opens a connection per request.
+
+#### Health endpoints (no authentication, no private data)
+
+- `GET /healthz` - liveness: `{"status":"ok"}` whenever the process runs.
+- `GET /readyz` - readiness: `200 {"status":"ready","database":"ok","schema":"ok"}`, or
+  `503` with `database` (`ok`/`unavailable`) and `schema` (`ok`/`not_ready`/`unknown`).
+  No URLs, versions, counts or names are returned. Point load-balancer/startup
+  probes at `/readyz` and process-supervisor liveness at `/healthz`.
+
+### Migration tool
+
+Four separate operations, each reading the destination URL from an environment
+variable (default `HUB_MIGRATION_DATABASE_URL`; the URL is never printed):
 
 ~~~sh
-export HUB_DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DBNAME'   # never commit this
-python3 -m persistence status  --destination-env HUB_DATABASE_URL
-python3 -m persistence migrate --destination-env HUB_DATABASE_URL
+python3 -m persistence status                              # A. inspect (read-only; creates nothing)
+python3 -m persistence migrate --dry-run                   #    list pending migrations
+python3 -m persistence migrate                             # B. apply schema migrations
+python3 -m persistence import-dry-run --source COPY.sqlite3 [--destination-env VAR]   # C. validate; writes nothing
+python3 -m persistence import-execute --source COPY.sqlite3 --destination-env VAR \
+    --confirm-write --confirm-database DBNAME              # D. real import
 ~~~
 
-Timestamps stay ISO-8601 `TEXT` and record bodies are `JSONB` so imported data
-is byte-for-byte comparable; IDs are preserved and identity sequences are
-advanced after import. Managed children such as Maddox exist only in
-`family_members` (a check constraint and importer validation reject a login).
-Sessions and login-attempt counters are ephemeral and are not imported.
+Safeguards: `import-execute` needs `--destination-env` named explicitly,
+`--confirm-write`, and `--confirm-database` equal to the destination's actual
+database name (shown by `import-dry-run --destination-env`). It also requires a
+fully migrated, **empty** destination and a source with zero validation errors.
+The source is read from a private temporary copy and is never written; the live
+`data/hub.sqlite3` is refused unless `--allow-live-source` is given. The import is one
+transaction that re-reads PostgreSQL and compares counts, key sets, status
+fields, checksums and references; any difference rolls everything back. A second
+import into a populated database is refused.
 
-### Importer: dry run, execute, validation
+Migration files in `persistence/migrations/postgres/` are named `NNNN_name.sql`,
+run in order each in its own transaction, and are recorded with a checksum in
+`schema_migrations`; editing an applied file, or a database ahead of the code, is
+an error. The application never runs `CREATE`/`ALTER` on PostgreSQL itself. Add a
+schema change as a new file; never edit an applied one.
 
-~~~sh
-# Dry run (default): reads a private temp copy of the source, writes nothing.
-python3 -m persistence import --source /path/to/copy.sqlite3
-# Optionally also check the destination schema version/emptiness (read-only):
-python3 -m persistence import --source /path/to/copy.sqlite3 --destination-env HUB_DATABASE_URL
-# Write (requires both flags, a migrated and empty destination, and zero validation errors):
-python3 -m persistence import --source /path/to/copy.sqlite3 --destination-env HUB_DATABASE_URL --execute --confirm-write
-~~~
+Timestamps stay ISO-8601 `TEXT` and record bodies are `JSONB`; IDs are preserved
+and identity sequences are advanced after import. Managed children such as
+Maddox exist only in `family_members`. Sessions and login-attempt counters are
+ephemeral and are not imported (everyone signs in again after cut-over).
 
-- `--source` is always explicit; `data/hub.sqlite3` is refused unless `--allow-live-source` is given.
-- The dry run reports table counts, records by kind, soft-deleted and archived
-  Dance counts, calendar-mirror counts, reminder state and per-table SHA-256
-  checksums. Exit code 2 means validation errors.
-- Validation reports (never discards) malformed JSON, unknown kinds, orphaned
-  audit/reminder/receipt/recurrence/family references, Dance link problems,
-  generated calendar events whose `sourceDanceId`/`sourceActivityId` does not
-  resolve to exactly one record of the right kind, and any login for a managed child.
-- An executed import runs in one transaction and re-reads PostgreSQL to compare
-  counts, key sets, status fields (deleted/archived/visibility/reminder state),
-  checksums and reference integrity; any difference rolls everything back.
+The dry run warns about `series_from_generated_occurrence`: Build C (before this
+build) turned every generated recurring occurrence into its own series each time
+the server restarted. That is fixed, but a database that was restarted with
+recurring items may already contain such rows; review them in the dry run.
 
 ### Rollback
 
@@ -216,7 +250,7 @@ the SQLite file before any real migration and rehearse on a copy first.
 python3 -m unittest -v        # everything on SQLite; PostgreSQL tests are reported as skipped
 # Everything on PostgreSQL (disposable database; each test class gets a private schema):
 export HUB_TEST_POSTGRES_URL='postgresql://USER:PASSWORD@127.0.0.1:PORT/DBNAME'
-python3 -m unittest -v test_persistence test_backend_parity
+python3 -m unittest -v test_persistence test_backend_parity test_hosted_readiness test_rehearsal
 HUB_TEST_BACKEND=postgres python3 -m unittest -v test_server     # the full HTTP/API suite on PostgreSQL
 ~~~
 
@@ -225,6 +259,8 @@ HUB_TEST_BACKEND=postgres python3 -m unittest -v test_server     # the full HTTP
   identical normalised responses for Dad, Mom and Arielle, plus failure-mode,
   concurrency and query-count tests.
 - `test_persistence.py` covers the repository contract, migrations and the importer.
+- `test_hosted_readiness.py` covers production configuration, TLS rules, the pool, health endpoints and recovery.
+- `test_rehearsal.py` builds a synthetic family, runs dry run -> import -> comparison, then the privacy and attack tests on PostgreSQL.
 - Server tests freeze the clock (20:00 UTC) and timezone, so they do not depend on the time of day, `HUB_TIMEZONE` or the machine's timezone.
 
 #### Temporary PostgreSQL for development

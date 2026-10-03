@@ -41,8 +41,11 @@ def _ensure_table(conn):
         applied_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
 
 
-def applied(conn):
-    _ensure_table(conn)
+def applied(conn, create=True):
+    if create:
+        _ensure_table(conn)
+    elif not conn.execute("SELECT to_regclass('schema_migrations') IS NOT NULL").fetchone()[0]:
+        return {}
     return {row[0]: (row[1], row[2]) for row in conn.execute("SELECT version,name,checksum FROM schema_migrations ORDER BY version")}
 
 
@@ -52,7 +55,7 @@ def current_version(conn):
 
 
 def status(conn, directory=MIGRATIONS_DIR):
-    known, done = discover(directory), applied(conn)
+    known, done = discover(directory), applied(conn, create=False)  # inspecting must never write
     return {
         "current": max(done) if done else 0,
         "latest": known[-1].version if known else 0,
@@ -64,9 +67,11 @@ def status(conn, directory=MIGRATIONS_DIR):
 def check_ready(conn, directory=MIGRATIONS_DIR):
     """Read-only startup check; never creates or alters anything. Raises SchemaNotReady with a non-secret message."""
     known = discover(directory)
+    from psycopg.rows import tuple_row
+    cursor = conn.cursor(row_factory=tuple_row)
     done = {}
-    if conn.execute("SELECT to_regclass('schema_migrations') IS NOT NULL").fetchone()[0]:
-        done = {row[0]: (row[1], row[2]) for row in conn.execute("SELECT version,name,checksum FROM schema_migrations")}
+    if cursor.execute("SELECT to_regclass('schema_migrations') IS NOT NULL").fetchone()[0]:
+        done = {row[0]: (row[1], row[2]) for row in cursor.execute("SELECT version,name,checksum FROM schema_migrations")}
     required = known[-1].version if known else 0
     current = max(done) if done else 0
     fix = "Run: python -m persistence migrate --destination-env HUB_DATABASE_URL"

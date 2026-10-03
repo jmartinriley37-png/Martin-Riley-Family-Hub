@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from persistence.config import ConfigError
 from persistence.errors import SchemaNotReady, StorageError
-from persistence.runtime import open_repository
+from persistence.runtime import check_readiness, close_pools, open_repository
 
 ROOT = Path(__file__).parent
 DB = os.environ.get("HUB_DB", str(ROOT / "data" / "hub.sqlite3"))
@@ -69,7 +69,7 @@ def initialize():
             record = row["body"]
             repeat = record.get("repeat", "One Time")
             start_date = record.get("dueDate") if row["kind"] == "tasks" else record.get("date", "")[:10]
-            if repeat == "One Time" or not start_date or c.get_series(row["id"], active_only=False):
+            if repeat == "One Time" or not start_date or record.get("seriesId") or c.get_series(row["id"], active_only=False):
                 continue
             record.update(seriesId=row["id"], occurrenceDate=start_date, occurrenceNumber=0)
             rule = dict(record, seriesKind=row["kind"])
@@ -1318,6 +1318,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_get(self):
         path = self.path.split("?")[0]
+        if path == "/healthz":
+            return self.respond(200, {"status": "ok"})
+        if path == "/readyz":
+            ready, details = check_readiness(DB)
+            return self.respond(200 if ready else 503, {"status": "ready" if ready else "not_ready", **details})
         if path == "/api/profiles":
             with repository() as c:
                 return self.respond(200, {"profiles": profile_data(c)})
@@ -1667,6 +1672,8 @@ class Handler(BaseHTTPRequestHandler):
                     previous = dict(r)
                     if kind == "events" and r.get("sourceDanceId") and action in {"edit", "delete"}:
                         return self.respond(403, {"error": "Edit or delete the source competition to keep its calendar dates in sync"})
+                    if kind == "events" and r.get("sourceActivityId") and action in {"edit", "delete"}:
+                        return self.respond(403, {"error": "Edit or delete the source activity to keep its calendar event in sync"})
                     if action in {"archive", "restore"}:
                         if kind != "dance" or not r.get("danceType"):
                             raise ValueError("Only Dance records can be archived or restored")
@@ -2030,4 +2037,11 @@ if __name__ == "__main__":
             c.delete_sessions_for(args.user)
         print("Account saved; previous sessions revoked.")
     else:
-        ThreadingHTTPServer((os.environ.get("HUB_HOST", "127.0.0.1"), int(os.environ.get("PORT", "8080"))), Handler).serve_forever()
+        httpd = ThreadingHTTPServer((os.environ.get("HUB_HOST", "127.0.0.1"), int(os.environ.get("PORT", "8080"))), Handler)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            httpd.server_close()
+            close_pools()
