@@ -72,7 +72,9 @@ def open_repository(sqlite_path, env=None):
             raise StorageError() from None
         return SQLiteRepository(conn)
     import psycopg
-    pool = _pool_for(config.postgres_url(env=env), env)
+    url = config.postgres_url(env=env)
+    config.check_environment_url(url, env)
+    pool = _pool_for(url, env)
     try:
         conn = pool.getconn()
     except psycopg.Error:

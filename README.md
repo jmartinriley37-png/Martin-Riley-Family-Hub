@@ -153,11 +153,13 @@ Environment variables (names only; values are secrets and never belong in Git):
 
 | Variable | Meaning |
 | --- | --- |
-| `HUB_ENV` | `development` (default) or `production`. Production refuses weak settings (below) |
-| `HUB_DB_BACKEND` | `sqlite` or `postgres`. **Required** when `HUB_ENV=production`. If `HUB_DATABASE_URL` is set but this is not, startup fails instead of using SQLite |
+| `HUB_ENV` | `development` (default), `staging` or `production`. Staging and production refuse weak settings (below) and require a database labelled for that environment |
+| `HUB_DB_BACKEND` | `sqlite` or `postgres`. **Required** when `HUB_ENV` is `staging` or `production` (staging is PostgreSQL only). If `HUB_DATABASE_URL` is set but this is not, startup fails instead of using SQLite |
 | `HUB_DB` | SQLite file path (SQLite mode only) |
 | `HUB_DATABASE_URL` | Runtime PostgreSQL URL used by the web server |
 | `HUB_MIGRATION_DATABASE_URL` | Optional separate URL (a more privileged role) used only by `python -m persistence`. The runtime role can then be limited to reading/writing application tables |
+| `HUB_ALLOW_REMOTE_DEV_DATABASE` | `1` lets `development` use a non-local PostgreSQL host. Only the staging test runner should set it |
+| `HUB_SECURE_COOKIE`, `HUB_ORIGIN` | Mandatory (`1` and an `https://` origin) in staging and production |
 | `HUB_DB_SSLMODE`, `HUB_DB_SSLROOTCERT` | TLS mode and optional CA bundle path |
 | `HUB_DB_POOL_MIN` / `HUB_DB_POOL_MAX` | Pool size, default 1 / 5 (1-50) |
 | `HUB_DB_POOL_TIMEOUT`, `HUB_DB_CONNECT_TIMEOUT` | Seconds to wait for a pooled connection (default 5) / to open one (default 5) |
@@ -199,11 +201,12 @@ close at shutdown. SQLite opens a connection per request.
 
 ### Migration tool
 
-Four separate operations, each reading the destination URL from an environment
+Separate operations, each reading the destination URL from an environment
 variable (default `HUB_MIGRATION_DATABASE_URL`; the URL is never printed):
 
 ~~~sh
 python3 -m persistence status                              # A. inspect (read-only; creates nothing)
+python3 -m persistence verify                              #    read-only row counts and per-table checksums (restore / cut-over checks)
 python3 -m persistence migrate --dry-run                   #    list pending migrations
 python3 -m persistence migrate                             # B. apply schema migrations
 python3 -m persistence import-dry-run --source COPY.sqlite3 [--destination-env VAR]   # C. validate; writes nothing
@@ -250,7 +253,7 @@ the SQLite file before any real migration and rehearse on a copy first.
 python3 -m unittest -v        # everything on SQLite; PostgreSQL tests are reported as skipped
 # Everything on PostgreSQL (disposable database; each test class gets a private schema):
 export HUB_TEST_POSTGRES_URL='postgresql://USER:PASSWORD@127.0.0.1:PORT/DBNAME'
-python3 -m unittest -v test_persistence test_backend_parity test_hosted_readiness test_rehearsal
+python3 -m unittest -v test_persistence test_backend_parity test_hosted_readiness test_rehearsal test_secret_hygiene
 HUB_TEST_BACKEND=postgres python3 -m unittest -v test_server     # the full HTTP/API suite on PostgreSQL
 ~~~
 
@@ -260,6 +263,8 @@ HUB_TEST_BACKEND=postgres python3 -m unittest -v test_server     # the full HTTP
   concurrency and query-count tests.
 - `test_persistence.py` covers the repository contract, migrations and the importer.
 - `test_hosted_readiness.py` covers production configuration, TLS rules, the pool, health endpoints and recovery.
+- `test_secret_hygiene.py` fails if a database file, key, `.env` or credential-bearing URL would be committed.
+- Running the PostgreSQL suites against a **hosted staging** database is documented in `DEPLOYMENT.md`; it needs `HUB_TEST_REMOTE_CONFIRM=staging` and a URL with `sslmode=verify-full`.
 - `test_rehearsal.py` builds a synthetic family, runs dry run -> import -> comparison, then the privacy and attack tests on PostgreSQL.
 - Server tests freeze the clock (20:00 UTC) and timezone, so they do not depend on the time of day, `HUB_TIMEZONE` or the machine's timezone.
 

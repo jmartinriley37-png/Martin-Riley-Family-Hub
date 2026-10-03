@@ -1,6 +1,6 @@
 """Environment-based database configuration. Never returns or logs credentials.
 
-HUB_ENV                       development (default) | production
+HUB_ENV                       development (default) | staging | production
 HUB_DB_BACKEND                sqlite | postgres (mandatory in production)
 HUB_DATABASE_URL              runtime PostgreSQL URL (secret)
 HUB_MIGRATION_DATABASE_URL    optional higher-privilege URL used only by the migration/import tool (secret)
@@ -14,7 +14,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SQLITE_PATH = ROOT / "data" / "hub.sqlite3"
 BACKENDS = {"sqlite", "postgres"}
-ENVIRONMENTS = {"development", "production"}
+ENVIRONMENTS = {"development", "staging", "production"}
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", ""}
 SSL_MODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 VERIFYING_SSL_MODES = {"verify-ca", "verify-full"}
 RUNTIME_URL_VAR = "HUB_DATABASE_URL"
@@ -40,17 +41,24 @@ def is_production(env=None):
     return environment(env) == "production"
 
 
+def is_hardened(env=None):
+    """Staging and production share the strict rules: explicit backend, verified TLS, a labelled database."""
+    return environment(env) != "development"
+
+
 def backend(env=None):
     values = _env(env)
     value = values.get("HUB_DB_BACKEND", "").strip().lower()
     if not value:
-        if is_production(values):
-            raise ConfigError("HUB_DB_BACKEND must be set explicitly when HUB_ENV=production")
+        if is_hardened(values):
+            raise ConfigError(f"HUB_DB_BACKEND must be set explicitly when HUB_ENV={environment(values)}")
         if values.get(RUNTIME_URL_VAR, "").strip():
             raise ConfigError(f"{RUNTIME_URL_VAR} is set but HUB_DB_BACKEND is not; refusing to fall back to SQLite")
         return "sqlite"
     if value not in BACKENDS:
         raise ConfigError(f"HUB_DB_BACKEND must be one of {sorted(BACKENDS)}")
+    if value == "sqlite" and environment(values) == "staging":
+        raise ConfigError("HUB_ENV=staging requires HUB_DB_BACKEND=postgres")
     return value
 
 
@@ -119,10 +127,10 @@ def connect_kwargs(url, env=None):
     mode = url_mode or values.get("HUB_DB_SSLMODE", "").strip().lower()
     if mode and mode not in SSL_MODES:
         raise ConfigError(f"HUB_DB_SSLMODE must be one of {sorted(SSL_MODES)}")
-    if is_production(values):
+    if is_hardened(values):
         mode = mode or "verify-full"
         if mode not in VERIFYING_SSL_MODES:
-            raise ConfigError("HUB_ENV=production requires sslmode verify-full (or verify-ca); certificate verification cannot be disabled")
+            raise ConfigError(f"HUB_ENV={environment(values)} requires sslmode verify-full (or verify-ca); certificate verification cannot be disabled")
     kwargs = {"connect_timeout": pool_settings(values)["connect_timeout"]}
     if mode:
         kwargs["sslmode"] = mode
@@ -132,3 +140,27 @@ def connect_kwargs(url, env=None):
             raise ConfigError("HUB_DB_SSLROOTCERT does not point to a readable file")
         kwargs["sslrootcert"] = root
     return kwargs
+
+
+def check_environment_url(url, env=None):
+    """Development may only talk to a local database, so a laptop or Codespace can never reach hosted data by accident."""
+    values = _env(env)
+    if environment(values) != "development" or values.get("HUB_ALLOW_REMOTE_DEV_DATABASE") == "1":
+        return
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        host = "?"
+    if host not in LOCAL_HOSTS:
+        raise ConfigError("HUB_ENV=development may only use a local PostgreSQL database; set HUB_ENV=staging or production for a hosted one")
+
+
+def check_web_settings(env=None):
+    """Staging and production must serve over HTTPS with Secure cookies and an Origin check."""
+    values = _env(env)
+    if not is_hardened(values):
+        return
+    if values.get("HUB_SECURE_COOKIE") != "1":
+        raise ConfigError(f"HUB_SECURE_COOKIE=1 is required when HUB_ENV={environment(values)}")
+    if not values.get("HUB_ORIGIN", "").startswith("https://"):
+        raise ConfigError(f"HUB_ORIGIN must be the site's https:// origin when HUB_ENV={environment(values)}")

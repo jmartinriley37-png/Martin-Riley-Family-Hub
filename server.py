@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from persistence import config
 from persistence.config import ConfigError
 from persistence.errors import SchemaNotReady, StorageError
 from persistence.runtime import check_readiness, close_pools, open_repository
@@ -56,6 +57,7 @@ def repository():
 def initialize():
     with repository() as c:
         c.ensure_schema()
+        c.assert_environment(config.environment())
         for account, display_name in DEFAULT_DISPLAY_NAMES.items():
             if c.get_user(account):
                 c.ensure_family_member(account, display_name, "account", account)
@@ -2022,6 +2024,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         initialize()
+        config.check_web_settings()
     except (StorageError, ConfigError) as error:
         raise SystemExit(f"error: {error}")
     if args.user:

@@ -2,6 +2,7 @@
 
   python -m persistence status         [--destination-env VAR]          read-only
   python -m persistence migrate        [--destination-env VAR] [--dry-run]
+  python -m persistence verify         [--destination-env VAR]          read-only counts and checksums (restore/cut-over checks)
   python -m persistence import-dry-run --source PATH [--destination-env VAR] [--allow-live-source]
   python -m persistence import-execute --source PATH --destination-env VAR --confirm-write --confirm-database NAME
 
@@ -18,7 +19,13 @@ from . import config, importer, migrator
 def _connect(var):
     import psycopg
     url = config.postgres_url(var)
-    return psycopg.connect(url, autocommit=True, **config.connect_kwargs(url))
+    config.check_environment_url(url)
+    conn = psycopg.connect(url, autocommit=True, **config.connect_kwargs(url))
+    label = migrator.environment_label(conn)
+    if label is not None and label != config.environment():
+        conn.close()
+        raise config.ConfigError("The destination database is labelled for a different environment than HUB_ENV; refusing to use it")
+    return conn
 
 
 def _emit(payload, as_json):
@@ -51,6 +58,7 @@ def build_parser():
         item.add_argument("--json", action="store_true")
 
     common(sub.add_parser("status", help="Read-only: schema version and pending migrations"))
+    common(sub.add_parser("verify", help="Read-only: per-table row counts and checksums, for restore and cut-over verification"))
     migrate = sub.add_parser("migrate", help="Apply pending schema migrations")
     common(migrate)
     migrate.add_argument("--dry-run", action="store_true", help="List pending migrations without applying them")
@@ -75,8 +83,17 @@ def main(argv=None):
                     ran = migrator.migrate(conn)
                 else:
                     ran = []
+                if args.command == "migrate" and not args.dry_run:
+                    migrator.label_environment(conn, config.environment())
                 state = migrator.status(conn)
-                _emit({"applied_now": ran, "dry_run": bool(getattr(args, "dry_run", False)), **state}, args.json)
+                _emit({"applied_now": ran, "dry_run": bool(getattr(args, "dry_run", False)), "environment": config.environment(),
+                       "database_label": migrator.environment_label(conn), **state}, args.json)
+            return 0
+        if args.command == "verify":
+            with _connect(args.destination_env) as conn:
+                conn.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                _emit({"environment": config.environment(), "database_label": migrator.environment_label(conn),
+                       **migrator.status(conn), **importer.summarize(importer.load_postgres(conn))}, args.json)
             return 0
         source = importer.check_source_path(args.source, args.allow_live_source)
         if args.command == "import-execute":

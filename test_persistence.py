@@ -7,6 +7,7 @@ import contextlib
 import copy
 import hashlib
 import io
+import json
 import os
 import sqlite3
 import tempfile
@@ -641,7 +642,7 @@ class PostgresMigrationTests(PostgresCase):
 
     def test_target_version_stops_early(self):
         self.assertEqual(migrator.migrate(self.conn, target=1), [1])
-        self.assertEqual(migrator.status(self.conn)["pending"], [2])
+        self.assertEqual(migrator.status(self.conn)["pending"], list(range(2, migrator.discover()[-1].version + 1)))
 
     def test_modified_applied_migration_is_detected(self):
         migrator.migrate(self.conn)
@@ -785,6 +786,23 @@ class PostgresImportTests(PostgresCase):
                         importer.execute_import(source, self.conn)
         for table in importer.TABLES:
             self.assertEqual(self.count(table), 0, table)
+
+    def test_verify_is_read_only_and_reports_stable_counts_and_checksums(self):
+        with sqlite_source() as (path, _), mock.patch.dict(os.environ, {"TEST_DEST_URL": self.url}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["migrate", "--destination-env", "TEST_DEST_URL"]), 0)
+                self.assertEqual(cli.main(["import-execute", "--source", str(path), "--destination-env", "TEST_DEST_URL",
+                                           "--confirm-write", "--confirm-database", self.database_name()]), 0)
+            reports = []
+            for _ in range(2):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(cli.main(["verify", "--destination-env", "TEST_DEST_URL", "--json"]), 0)
+                reports.append(json.loads(out.getvalue()))
+            self.assertEqual(reports[0], reports[1])
+            self.assertGreater(reports[0]["counts"]["records"], 0)
+            self.assertEqual(set(reports[0]["checksums"]), set(importer.TABLES))
+            self.assertNotIn(self.url, json.dumps(reports[0]))
 
     def database_name(self):
         return self.conn.execute("SELECT current_database()").fetchone()[0]

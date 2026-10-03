@@ -64,6 +64,19 @@ def status(conn, directory=MIGRATIONS_DIR):
     }
 
 
+def environment_label(conn):
+    """The environment this database is labelled for, or None. Read-only."""
+    if not conn.execute("SELECT to_regclass('hub_environment') IS NOT NULL").fetchone()[0]:
+        return None
+    row = conn.execute("SELECT name FROM hub_environment").fetchone()
+    return row[0] if row else None
+
+
+def label_environment(conn, name):
+    conn.execute("INSERT INTO hub_environment(name) VALUES(%s) ON CONFLICT DO NOTHING", (name,))
+    return environment_label(conn)
+
+
 def check_ready(conn, directory=MIGRATIONS_DIR):
     """Read-only startup check; never creates or alters anything. Raises SchemaNotReady with a non-secret message."""
     known = discover(directory)

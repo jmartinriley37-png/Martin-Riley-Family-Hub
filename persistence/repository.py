@@ -7,7 +7,7 @@ connection handling, JSON/boolean conversion and a few fragments.
 import json
 import sqlite3
 
-from .errors import SchemaNotReady, StorageConflict, StorageError, StorageInvalid
+from .errors import EnvironmentMismatch, SchemaNotReady, StorageConflict, StorageError, StorageInvalid
 
 SOURCE_FIELDS = {"sourceDanceId", "sourceActivityId", "sourceRequestId", "seriesId"}
 WRITE_LOCK_KEY = 7_419_052_002  # serialises read-modify-write requests on PostgreSQL (SQLite uses BEGIN IMMEDIATE)
@@ -103,6 +103,9 @@ class Repository:
     def check_schema(self):
         """Raise SchemaNotReady unless the database has the schema this code needs."""
         raise NotImplementedError
+
+    def assert_environment(self, name):
+        """PostgreSQL databases are labelled with their environment; SQLite files are not."""
 
     def __enter__(self):
         return self
@@ -457,6 +460,14 @@ class PostgresRepository(Repository):
             raise StorageError() from None
         finally:
             self.rollback()
+
+    def assert_environment(self, name):
+        label = self._rows("SELECT name FROM hub_environment")
+        label = label[0]["name"] if label else None
+        if label is None and name != "development":
+            raise EnvironmentMismatch("The database has no environment label. Run: python -m persistence migrate")
+        if label is not None and label != name:
+            raise EnvironmentMismatch("This database is labelled for a different environment than HUB_ENV; refusing to use it.")
 
     def _run(self, sql, params=()):
         cursor = self.conn.execute(sql.replace("%", "%%").replace("?", "%s"), tuple(params))

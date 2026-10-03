@@ -484,7 +484,7 @@ class PostgresConnectionFailureTests(unittest.TestCase):
                 with self.assertRaises(SchemaNotReady) as caught:
                     server.initialize()
                 self.assertIn("0000", str(caught.exception))
-                self.assertIn("0002", str(caught.exception))
+                self.assertIn("0003", str(caught.exception))
                 self.assertIn("python -m persistence migrate", str(caught.exception))
                 self.assert_safe(str(caught.exception))
                 status, body, _ = self.request({}, "state")
@@ -508,7 +508,7 @@ class PostgresConnectionFailureTests(unittest.TestCase):
                 with self.assertRaises(SchemaNotReady) as caught:
                     server.initialize()
                 self.assertIn("0001", str(caught.exception))
-                self.assertIn("0002", str(caught.exception))
+                self.assertIn("0003", str(caught.exception))
             finally:
                 for cleanup in reversed(cleanups):
                     cleanup()

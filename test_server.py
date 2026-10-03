@@ -72,6 +72,23 @@ def raw():
 def stored_body(value):
     return value if isinstance(value, dict) else json.loads(value)
 
+def is_local_url(url):
+    from urllib.parse import urlsplit
+    return (urlsplit(url).hostname or '') in {'localhost', '127.0.0.1', '::1', ''}
+
+def require_safe_remote_test_database(url):
+    """Hosted databases are for staging rehearsals only: explicit opt-in, verified TLS, and never one labelled production."""
+    import psycopg
+    if os.environ.get('HUB_TEST_REMOTE_CONFIRM') != 'staging':
+        raise unittest.SkipTest('A hosted HUB_TEST_POSTGRES_URL needs HUB_TEST_REMOTE_CONFIRM=staging (staging databases only)')
+    if 'sslmode=verify-full' not in url and 'sslmode=verify-ca' not in url:
+        raise unittest.SkipTest('A hosted HUB_TEST_POSTGRES_URL must include sslmode=verify-full')
+    with psycopg.connect(url, autocommit=True, connect_timeout=10) as conn:
+        if conn.execute("SELECT to_regclass('public.hub_environment') IS NOT NULL").fetchone()[0]:
+            label = conn.execute('SELECT name FROM public.hub_environment').fetchone()
+            if label and label[0] == 'production':
+                raise RuntimeError('Refusing to run tests against a database labelled production')
+
 def start_backend(backend, directory, migrate=True):
     """Point the server at a fresh synthetic database. Returns (cleanups, database_url_or_None)."""
     cleanups, url = [], None
@@ -80,11 +97,14 @@ def start_backend(backend, directory, migrate=True):
         from persistence import migrator
         if not PG_URL:
             raise unittest.SkipTest('Set HUB_TEST_POSTGRES_URL to run against PostgreSQL')
+        remote = not is_local_url(PG_URL)
+        if remote:
+            require_safe_remote_test_database(PG_URL)
         schema = 't_' + uuid.uuid4().hex[:12]
         with psycopg.connect(PG_URL, autocommit=True) as admin:
             admin.execute(f'CREATE SCHEMA {schema}')
         url = PG_URL + ('&' if '?' in PG_URL else '?') + f'options=-csearch_path%3D{schema}'
-        patch = mock.patch.dict(os.environ, {'HUB_DB_BACKEND': 'postgres', 'HUB_DATABASE_URL': url})
+        patch = mock.patch.dict(os.environ, {'HUB_DB_BACKEND': 'postgres', 'HUB_DATABASE_URL': url, **({'HUB_ALLOW_REMOTE_DEV_DATABASE': '1'} if remote else {})})
         patch.start()
         cleanups.append(patch.stop)
         def drop():

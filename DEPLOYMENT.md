@@ -61,38 +61,159 @@ reviewed production security are separate follow-up work.
 Nothing here has been run against real family data. Rehearse every step on a
 synthetic copy first (`test_rehearsal.py` does this automatically).
 
-### Procedure
+### Environments and database separation
 
-1. **Provision** a managed PostgreSQL 14+ database in a private network or with
-   an IP allow-list. Create two roles: a *migration* role that owns the schema, and
-   a *runtime* role with only `SELECT, INSERT, UPDATE, DELETE` on the tables and
-   `USAGE` on the sequences, plus `SELECT` on `schema_migrations` (no DDL, not a superuser).
-2. **Configure secrets** in the service manager or secret store, never in Git or
-   shell history: `HUB_ENV=production`, `HUB_DB_BACKEND=postgres`,
-   `HUB_DATABASE_URL` (runtime role), `HUB_MIGRATION_DATABASE_URL` (migration role,
-   present only on the machine/session that runs the migration tool).
-3. **Verify TLS**: use `sslmode=verify-full` (the production default) and
-   `HUB_DB_SSLROOTCERT` if the provider's CA is not in the system store. A
-   connection that cannot be verified must fail; do not lower `sslmode`.
-4. **Apply migrations**: `python3 -m persistence status`, then
-   `python3 -m persistence migrate --dry-run`, then `python3 -m persistence migrate`.
-5. **Test readiness**: start the server; `GET /readyz` must return `200` with
-   `database: ok, schema: ok`. `GET /healthz` is liveness only.
-6. **Dry-run the SQLite import** against a *copy* of the SQLite database made with
-   the SQLite online backup API: `python3 -m persistence import-dry-run --source COPY.sqlite3 --destination-env HUB_MIGRATION_DATABASE_URL`.
-7. **Review the dry run**: zero errors; counts and per-table checksums are what
-   you expect; read every warning (for example `series_from_generated_occurrence`).
-8. **Stop the SQLite-backed app**, take a final verified backup copy, and run
-   `import-execute --confirm-write --confirm-database <name>` from that copy. The
-   import is one transaction with validation; any mismatch rolls back.
-9. **Verify privacy and integrity** on PostgreSQL: sign in as Dad, Mom and Arielle,
-   inspect each real `/api/state` response (Adult Vault, Adults Only, both Me Only
-   spaces, fees and parent notes), and compare counts with the dry run.
-10. **Start the application** on PostgreSQL behind HTTPS. Everyone signs in again
-    (sessions are not migrated).
-11. **Device acceptance**: Android and iPhone installs, task completion, approvals,
-    and changes appearing on another phone within five seconds.
-12. **Establish backup monitoring** (below) before relying on the system.
+| Environment | Database | Rules enforced by the application |
+| --- | --- | --- |
+| `development` (default) | SQLite, or a **local** PostgreSQL (loopback host only) | A remote database host is refused unless `HUB_ALLOW_REMOTE_DEV_DATABASE=1` (used only by the staging test runner) |
+| `staging` | Hosted PostgreSQL, **synthetic data only**, its own credentials | `HUB_DB_BACKEND=postgres` required, verified TLS, `HUB_SECURE_COOKIE=1`, `https://` `HUB_ORIGIN`, database must carry the `staging` label |
+| `production` | A different hosted database with different credentials | Same strict rules; database must carry the `production` label |
+
+- `python -m persistence migrate` writes the environment label (`hub_environment`,
+  migration 0003) from `HUB_ENV`. At startup the server refuses a database whose
+  label differs from `HUB_ENV`, and refuses an unlabelled database in staging or
+  production. The migration tool also refuses a mismatched label. Staging and
+  production therefore cannot share a database even if a URL is pasted into the
+  wrong place. Error messages never echo the label, host, user or URL.
+- Use a separate provider project (or at minimum a separate database and role) per
+  environment, with different credentials stored in the provider's secret manager.
+- Never reuse a staging URL in production configuration or the reverse.
+
+### Staging rehearsal runbook (synthetic data only)
+
+1. Create the staging database at a managed PostgreSQL provider (see the provider
+   checklist below). Use a **direct, non-pooled** connection string for the
+   migration tool and the test runner (`options=` start-up parameters, used by the
+   per-test schemas, are rejected by pooling proxies such as PgBouncer).
+2. Put the URL in an environment variable or the provider's secret store, never in a file
+   in the repository. The URL must include `sslmode=verify-full`.
+3. `export HUB_ENV=staging HUB_DB_BACKEND=postgres HUB_SECURE_COOKIE=1 HUB_ORIGIN=https://<staging-host>`, then
+   `python3 -m persistence status`, `migrate --dry-run`, `migrate`, `verify`.
+4. Run the full test matrix against it. Tests only create and drop private
+   schemas, but they kill pooled connections on purpose, so use a dedicated staging database:
+
+   ~~~sh
+   export HUB_TEST_POSTGRES_URL=...   # staging URL with sslmode=verify-full (secret)
+   export HUB_TEST_REMOTE_CONFIRM=staging
+   export HUB_ALLOW_REMOTE_DEV_DATABASE=1   # lets the development-mode tests reach the hosted staging host
+   python3 -m unittest test_persistence test_backend_parity test_hosted_readiness test_rehearsal
+   HUB_TEST_BACKEND=postgres python3 -m unittest test_server
+   HUB_PERF_REPORT=1 python3 -m unittest test_backend_parity.QueryBudgetTests
+   ~~~
+
+   The runner refuses a remote URL without `HUB_TEST_REMOTE_CONFIRM=staging` or
+   without verified TLS, and refuses any database labelled `production`.
+5. Import the synthetic family (`test_rehearsal.py` builds one) with
+   `import-execute`, then `verify` and run the privacy checks against the running staging server.
+6. Rehearse backup and restore (below) and record results.
+
+### Provider checklist (verify each item in the provider's console; do not assume)
+
+- PostgreSQL major version (14+), region, and whether storage is encrypted at rest.
+- TLS: certificate chain verifiable with the system store or a downloadable CA.
+- Automated backups: frequency, **retention period on your plan**, and whether
+  point-in-time recovery (PITR) is included or extra cost.
+- Restore mechanism: restore to a *new* branch/database, not in place.
+- Role model: can you create a separate runtime role without DDL rights?
+- Connection limits (the pool defaults to at most 5), idle-suspend/cold-start
+  behaviour (first request after idle may be slow), and cost of compute and storage.
+- Whether a direct (non-pooled) endpoint is offered for migrations.
+
+### Production procedure (future; none of it has been run)
+
+**Principle: the original SQLite database is never the import working copy.**
+It is only ever copied. It stays untouched as the rollback source.
+
+1. **Prerequisites**: staging passed every test above; provider backups verified;
+   production database created **empty**, with its own credentials, in a project separate from staging.
+2. **Staging verification**: re-run the staging matrix on the exact commit to be deployed.
+3. **Back up the original SQLite**: stop the application, then take a backup with
+   the SQLite online backup API to encrypted storage.
+4. **Record the original's SHA-256, size and mtime** (database, `-wal`, `-shm`).
+5. **Make a private COPY** of the database and its WAL/SHM files (mode 700 directory).
+6. **Upgrade the COPY if needed** through the normal startup path with `HUB_DB` pointing at the copy only (see the precondition section).
+7. **`import-dry-run` against the upgraded copy.**
+8. **Human review checkpoint**: zero errors; every warning understood; record counts
+   match expectations. Nothing proceeds without explicit sign-off.
+9. **Migrate the production database**: `HUB_ENV=production`, then `migrate` with the migration role; confirm the `production` label with `verify`.
+10. **Synthetic production smoke test before real import**: import the synthetic
+    family into the *empty* production database in a rehearsal window, run the privacy checks, then
+    empty it again (drop and recreate the database or restore the empty snapshot); re-migrate. Real data
+    never goes in until this passes. `import-execute` refuses a non-empty destination.
+11. **Real import**: from the upgraded copy only, with `--confirm-write --confirm-database <name>`.
+12. **Row/count/checksum verification**: `python -m persistence verify` on production versus the dry-run counts and per-table checksums.
+13. **Dad privacy test**: sign in as Dad; inspect the raw `/api/state` for Family, Adults Only, his Me Only, Adult Vault; no Mom Me Only.
+14. **Mom privacy test**: the same for Mom; no Dad Me Only.
+15. **Child privacy test**: no Adults Only, no Me Only, no Vault, no financial or parent-private fields; then attempt direct API mutations and confirm rejection.
+16. **Calendar-mirror integrity**: each competition and activity event has exactly one mirror; direct edit/delete of a mirror is rejected.
+17. **Recurrence integrity**: no series created from generated occurrences; restart the server three times and compare series and occurrence counts.
+18. **Application cut-over**: set `HUB_ENV=production` secrets, start the server, `GET /readyz` must be 200, point the proxy at it, have everyone sign in again.
+19. **Rollback**: stop the new application and restart the **original** SQLite deployment (unchanged since step 4). Changes made on PostgreSQL after cut-over exist only there;
+    after the family has used PostgreSQL, rollback means restoring a PostgreSQL backup instead.
+20. **Post-cutover backup verification**: confirm the provider's first automated
+    backup exists, run the restore rehearsal into a scratch database, `verify` it against production, and set up backup-age alerts.
+
+### Backup and restore rehearsal (verified on hosted Neon staging, synthetic data)
+
+Verified on the hosted staging database and, earlier, a local throwaway PostgreSQL:
+`pg_dump --format=custom --no-owner --schema=public` -> intentionally damage staging ->
+`pg_restore --clean --if-exists --no-owner --no-privileges` into a **separate scratch
+database** -> `python -m persistence verify` on the restore showed row counts, record kinds and every
+per-table checksum identical to the pre-damage state, the `staging` label and schema version were
+restored, and the Dad/Mom/Arielle privacy checks passed through the real API on the restored copy.
+Staging itself was left untouched by the restore, the scratch database was dropped afterwards.
+
+- Use a `pg_dump` whose major version is **at least the server's** (Neon staging reported PostgreSQL 18; a
+  `postgres:18-alpine` container was used so no client is installed on the host).
+- Pass the connection string to the tool through an environment variable, not on the command line.
+- `--no-privileges` is required on Neon: the dump otherwise contains provider-owned `ALTER DEFAULT PRIVILEGES`
+  statements that an ordinary role is not allowed to replay.
+- A dump of a 190-record synthetic family is about 55 KB and took about 3 s to take and 4 s to restore.
+
+**Not verified:** Neon's own point-in-time restore/branching, its retention period and cost on your plan.
+Those are only visible in the provider console; confirm them there (checklist above) and repeat the
+rehearsal with the provider's restore into a new branch. The logical dump above is the independent,
+provider-neutral copy and should be scheduled off-provider regardless.
+
+Manual procedure: dump as above (encrypt and store off-provider); restore into a new database with
+`pg_restore --clean --if-exists --no-owner --no-privileges -d <new database>`; run `python -m persistence verify`
+against both and compare; run the privacy checks; only then point the application at it.
+
+### Hosted staging findings (Neon)
+
+- Connection: use the **direct (non-pooled)** endpoint. The stored string asked for `sslmode=require`
+  (encrypts but does **not** verify the certificate) and `channel_binding=require`. For staging and production
+  change `sslmode` to `verify-full` and add `sslrootcert=/etc/ssl/certs/ca-certificates.crt` (the system bundle
+  on Debian/Ubuntu images). Negative controls confirmed that a missing CA file, a CA bundle without the
+  issuing CA, and `sslmode=disable` are all refused. Keep `channel_binding=require`.
+- The owner role can create roles and databases; a DML-only runtime role ran the full application and was denied
+  DDL. PostgreSQL 16+ requires `GRANT <role> TO <owner>` before the owner may `DROP OWNED BY` that role.
+- Latency: one SQL round trip from the Codespace averaged about 22 ms, so `/api/state` (18 queries plus pool health
+  check and two commits) took 570-750 ms. Put the database in the **same region as the application host**
+  and re-measure; most of the cost is network round trips, not database work.
+- The first connection after idle took about 0.9 s (compute wake-up); expect a slow first request.
+
+### Authentication review for internet exposure
+
+Suitable for **private family staging** behind HTTPS; **not yet sufficient for open internet exposure** without the follow-ups below.
+
+| Area | Finding |
+| --- | --- |
+| Password storage | scrypt (N=16384, r=8, p=1), 16-byte random salt, constant-time compare. Acceptable; N could be raised |
+| Password policy and reset | 12+ characters; set or reset only through the interactive CLI on the server, which also revokes that person's sessions. No self-service reset or recovery |
+| Default credentials | None; accounts exist only after the CLI creates them |
+| Session tokens | 256-bit random token, only its SHA-256 is stored, 7-day fixed lifetime, deleted on logout; expired rows are purged at login. No sliding renewal, no per-user session list |
+| Cookie flags | `HttpOnly`, `SameSite=Strict`, `Path=/`; `Secure` only when `HUB_SECURE_COOKIE=1` (now mandatory in staging/production) |
+| CSRF | Custom `X-Hub-Request` header on every POST, optional `Origin` check (`HUB_ORIGIN`, now mandatory in staging/production), `SameSite=Strict` |
+| Brute force | 10 attempts per client address per 15 minutes; behind a proxy all users share one address, so add proxy-level per-client limits. No per-account lockout or alerting |
+| Account enumeration | Login returns one generic message and compares a dummy hash for unknown names, **but `GET /api/profiles` is unauthenticated and returns the three accounts' first names**. Remove or protect before public exposure |
+| Logging | Request logging is disabled; storage errors log only a class name; no passwords or cookies are logged |
+| Transport and headers | The app does not terminate TLS or send HSTS or CSP; the reverse proxy must (see above). Static files send `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy` |
+| No MFA | No second factor |
+
+**Next checkpoint for production auth (not done here):** protect `/api/profiles`, add per-account
+throttling and proxy rate limiting, sliding session expiry with a "sign out everywhere" option, a
+password-change flow, optional MFA, CSP/HSTS at the proxy, and an external security review.
 
 ### Precondition: never import the original SQLite file directly
 

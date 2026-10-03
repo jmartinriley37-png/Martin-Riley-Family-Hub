@@ -11,3 +11,11 @@ __pycache__/
 .pgpass
 *.pem
 *.key
+*.sqlite
+*.db
+*.pgdump
+*.p12
+*.pfx
+pg_service.conf
+.neon
+.vercel

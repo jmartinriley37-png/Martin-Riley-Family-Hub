@@ -24,3 +24,7 @@ class StorageInvalid(StorageError):
 
 class SchemaNotReady(StorageError):
     """The PostgreSQL database has not been migrated to the version this code requires."""
+
+
+class EnvironmentMismatch(StorageError):
+    """The database is labelled for a different environment than the one the server was started in."""

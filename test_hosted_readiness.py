@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -59,6 +60,35 @@ class ConfigTests(unittest.TestCase):
             config.backend({"HUB_DATABASE_URL": f"postgresql://u:{SECRET}@h/db"})
         self.assertNotIn(SECRET, str(caught.exception))
         self.assertEqual(config.backend({}), "sqlite")
+
+    def test_staging_is_hardened_like_production_and_never_uses_sqlite(self):
+        staging = {"HUB_ENV": "staging"}
+        with self.assertRaises(config.ConfigError):
+            config.backend(staging)
+        with self.assertRaises(config.ConfigError):
+            config.backend({**staging, "HUB_DB_BACKEND": "sqlite"})
+        self.assertEqual(config.backend({**staging, "HUB_DB_BACKEND": "postgres"}), "postgres")
+        self.assertEqual(config.connect_kwargs("postgresql://u:p@h/db", staging)["sslmode"], "verify-full")
+        with self.assertRaises(config.ConfigError):
+            config.connect_kwargs("postgresql://u:p@h/db", {**staging, "HUB_DB_SSLMODE": "require"})
+
+    def test_development_refuses_a_remote_database(self):
+        for local in ("postgresql://u:p@127.0.0.1:5432/db", "postgresql://u:p@localhost/db", "postgresql://u:p@[::1]/db"):
+            config.check_environment_url(local, {})
+        for remote in ("postgresql://u:p@ep-example.neon.tech/db", "postgresql://u:p@10.0.0.5/db", "postgresql://u:p@[bad/db"):
+            with self.assertRaises(config.ConfigError, msg=remote):
+                config.check_environment_url(remote, {})
+        config.check_environment_url("postgresql://u:p@ep-example.neon.tech/db", {"HUB_ENV": "staging"})
+        config.check_environment_url("postgresql://u:p@ep-example.neon.tech/db", {"HUB_ALLOW_REMOTE_DEV_DATABASE": "1"})
+
+    def test_hardened_environments_require_secure_cookies_and_an_https_origin(self):
+        good = {"HUB_SECURE_COOKIE": "1", "HUB_ORIGIN": "https://family.example.com"}
+        config.check_web_settings({})  # development is unrestricted
+        for name in ("staging", "production"):
+            config.check_web_settings({"HUB_ENV": name, **good})
+            for broken in ({**good, "HUB_SECURE_COOKIE": "0"}, {**good, "HUB_ORIGIN": "http://family.example.com"}, {"HUB_SECURE_COOKIE": "1"}):
+                with self.assertRaises(config.ConfigError, msg=broken):
+                    config.check_web_settings({"HUB_ENV": name, **broken})
 
     def test_unknown_environment_is_rejected(self):
         with self.assertRaises(config.ConfigError):
@@ -170,7 +200,8 @@ class PostgresHostedTests(unittest.TestCase):
         return url
 
     def env(self, url, **extra):
-        return {"HUB_DB_BACKEND": "postgres", "HUB_DATABASE_URL": url, **extra}
+        remote = {} if ts.is_local_url(url) else {"HUB_ALLOW_REMOTE_DEV_DATABASE": "1"}
+        return {"HUB_DB_BACKEND": "postgres", "HUB_DATABASE_URL": url, **remote, **extra}
 
     def admin(self, url):
         import psycopg
@@ -212,6 +243,57 @@ class PostgresHostedTests(unittest.TestCase):
             conn.execute("DELETE FROM schema_migrations WHERE version=2")
         self.assertEqual(get("/readyz")[1]["schema"], "not_ready")
 
+    # --- environment separation
+    def test_the_migration_tool_labels_the_database_and_the_server_enforces_the_label(self):
+        import io as _io
+        from persistence import cli
+        url = self.backend(migrate=False)
+        with mock.patch.dict(os.environ, {"REHEARSAL_URL": url, "HUB_ENV": "development"}), contextlib.redirect_stdout(_io.StringIO()):
+            self.assertEqual(cli.main(["migrate", "--destination-env", "REHEARSAL_URL", "--json"]), 0)
+        with self.admin(url) as conn:
+            self.assertEqual(conn.execute("SELECT name FROM hub_environment").fetchone()[0], "development")
+        server.initialize()  # development matches
+        with self.admin(url) as conn:
+            conn.execute("UPDATE hub_environment SET name='staging'")
+        from persistence.errors import EnvironmentMismatch
+        with self.assertRaises(EnvironmentMismatch):
+            server.initialize()
+        with mock.patch.dict(os.environ, {"REHEARSAL_URL": url, "HUB_ENV": "development"}), contextlib.redirect_stderr(_io.StringIO()) as err:
+            self.assertEqual(cli.main(["status", "--destination-env", "REHEARSAL_URL"]), 1)
+            self.assertIn("different environment", err.getvalue())
+            self.assertEqual(cli.main(["migrate", "--destination-env", "REHEARSAL_URL"]), 1)
+
+    def test_labels_mismatch_and_missing_labels_are_refused_by_the_repository(self):
+        url = self.backend()
+        patch = mock.patch.dict(os.environ, self.env(url))
+        patch.start()
+        self.addCleanup(patch.stop)
+        from persistence.errors import EnvironmentMismatch
+        with server.repository() as repo:
+            repo.assert_environment("development")  # unlabelled databases are only acceptable in development
+            for hardened in ("staging", "production"):
+                with self.assertRaises(EnvironmentMismatch) as caught:
+                    repo.assert_environment(hardened)
+                self.assertIn("migrate", str(caught.exception))
+        with self.admin(url) as conn:
+            conn.execute("INSERT INTO hub_environment(name) VALUES('staging')")
+        with server.repository() as repo:
+            repo.assert_environment("staging")
+            for wrong in ("development", "production"):
+                with self.assertRaises(EnvironmentMismatch) as caught:
+                    repo.assert_environment(wrong)
+                self.assertNotIn("staging", str(caught.exception))  # names are not echoed
+        with self.admin(url) as conn:
+            with self.assertRaises(Exception):
+                conn.execute("INSERT INTO hub_environment(name) VALUES('production')")  # exactly one label per database
+            with self.assertRaises(Exception):
+                conn.execute("UPDATE hub_environment SET name='bogus'")
+
+    def test_development_cannot_open_a_remote_database_through_the_runtime(self):
+        env = {"HUB_DB_BACKEND": "postgres", "HUB_DATABASE_URL": "postgresql://u:p@db.example.invalid:5432/hub"}
+        with self.assertRaises(config.ConfigError):
+            runtime.open_repository(None, env)
+
     # --- startup refusals
     def test_database_version_ahead_of_the_application_is_refused(self):
         url = self.backend()
@@ -234,6 +316,7 @@ class PostgresHostedTests(unittest.TestCase):
             self.assertNotIn("authentication", text.lower())
             self.assertNotIn("postgres", text.lower())
 
+    @unittest.skipUnless(ts.is_local_url(PG_URL) if PG_URL else True, "the local container has no TLS; a hosted database does")
     def test_tls_failure_in_production_is_generic_and_never_downgrades(self):
         # The throwaway local container has no TLS, so a verifying client must refuse to talk to it.
         url = self.backend()
@@ -250,7 +333,8 @@ class PostgresHostedTests(unittest.TestCase):
 
     def test_weak_tls_configuration_is_rejected_before_connecting(self):
         url = self.backend()
-        env = {"HUB_ENV": "production", **self.env(url, HUB_DB_SSLMODE="require")}
+        weak_url = re.sub(r"sslmode=[a-z-]+", "sslmode=require", url) if "sslmode=" in url else url
+        env = {"HUB_ENV": "production", **self.env(weak_url, HUB_DB_SSLMODE="require")}
         with mock.patch.dict(os.environ, env):
             with self.assertRaises(config.ConfigError):
                 server.initialize()
@@ -347,8 +431,11 @@ class PostgresHostedTests(unittest.TestCase):
         url = self.backend()
         schema = url.rsplit("%3D", 1)[1]
         role, password = "hub_rt_" + secrets.token_hex(4), secrets.token_hex(12)
-        with self.admin(PG_URL) as admin:
-            admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+        try:
+            with self.admin(PG_URL) as admin:
+                admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+        except Exception:
+            self.skipTest("this account may not create roles")
         self.addCleanup(self.drop_role, role, schema)
         with self.admin(url) as admin:
             admin.execute(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
@@ -372,6 +459,7 @@ class PostgresHostedTests(unittest.TestCase):
     def drop_role(self, role, schema):
         runtime.close_pools()
         with self.admin(PG_URL) as admin:
+            admin.execute(f"GRANT {role} TO CURRENT_USER")  # PostgreSQL 16+ needs membership to drop another role's objects
             admin.execute(f"DROP OWNED BY {role}")
             admin.execute(f"DROP ROLE {role}")
 
